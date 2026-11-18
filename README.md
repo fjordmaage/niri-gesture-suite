@@ -34,9 +34,11 @@ working exactly as before.
 The extra gestures also run on the **trackpad**: pinches, 4/5-finger taps, 4-finger horizontal media swipes,
 and hold-to-move/resize at the mouse cursor (pinch-close targets the window
 under the cursor via a compositor-consumed Mod+click). Native niri
-3/4-finger trackpad swipes pass through untouched: 3+ finger input is
-buffered for a few milliseconds until classified, then either replayed to
-the virtual clone verbatim (a swipe) or claimed (a pinch, hold, or tap).
+3/4-finger trackpad swipes pass through live with **zero added latency** —
+since 3+ finger touchpad input never reaches apps, everything is forwarded
+to the clone immediately while the daemon classifies in parallel; a pinch,
+hold, or tap that claims the gesture cancels the clone's contacts, ending
+whatever libinput had tentatively begun.
 
 ## Design
 
