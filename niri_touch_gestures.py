@@ -479,6 +479,8 @@ class GestureEngine:
         # because the device only reports values that changed.
         self.down = {}           # slot -> tracking_id (fingers on screen)
         self.pos = {}            # slot -> [x, y], persistent cache (real dev)
+        self.real_keys = {}      # EV_KEY state of the real device
+        self.real_abs = {}       # single-touch ABS_X/ABS_Y of the real device
         self.cur_slot = 0
         self.key_state = {}      # EV_KEY code -> value (mirrors clone)
         self.clone_pos = {}      # slot -> (x, y) as last written to clone
@@ -544,6 +546,10 @@ class GestureEngine:
                     self.pos.setdefault(self.cur_slot, [None, None])[0] = value
                 elif code == ec.ABS_MT_POSITION_Y:
                     self.pos.setdefault(self.cur_slot, [None, None])[1] = value
+                elif code in (ec.ABS_X, ec.ABS_Y):
+                    self.real_abs[code] = value
+            elif etype == ec.EV_KEY:
+                self.real_keys[code] = value
 
     def _emit(self, events):
         """Send events to the clone, mirroring its per-slot position cache."""
@@ -1288,8 +1294,7 @@ class TrackpadEngine(GestureEngine):
         self.relay_claimed = True
         self.resync = True
 
-    def _relay_replay(self):
-        """Not one of ours: hand the buffered frames to the clone."""
+    def _relay_resync(self):
         if self.resync:
             # an earlier claimed gesture was swallowed; bring the clone's
             # per-slot position caches up to date first
@@ -1297,15 +1302,45 @@ class TrackpadEngine(GestureEngine):
             if prefix:
                 self._emit(prefix)
             self.resync = False
-        # Pace the frames slightly so libinput sees finite velocities
-        # instead of a zero-duration burst (capped at ~20 ms total).
-        pace = min(0.002, 0.02 / max(len(self.relay_buf), 1))
-        for i, frame in enumerate(self.relay_buf):
+
+    def _relay_replay(self):
+        """Not one of ours and the fingers are lifting: hand the buffered
+        frames to the clone verbatim (used for taps, where the deltas are
+        tiny and libinput's touch-jump detection cannot trigger)."""
+        self._relay_resync()
+        for frame in self.relay_buf:
             evs = [(t, c, v) for t, c, v in frame if t != ec.EV_SYN]
             if evs:
                 self._emit(evs)
-                if i + 1 < len(self.relay_buf):
-                    time.sleep(pace)
+        self.relay_buf = []
+        self.relay_pre = set()
+
+    def _relay_catchup(self):
+        """A native swipe is underway: collapse the buffer into one frame
+        that lands/advances the contacts at their current positions, then
+        let the live stream continue. Replaying the motion history as a
+        burst would be read by libinput's touch-jump detection (deltas are
+        normalized to a 12 ms frame interval) as hardware glitches, and the
+        fastest part of the swipe would be discarded."""
+        self._relay_resync()
+        out = []
+        for slot in sorted(self.down):
+            p = self.pos.get(slot)
+            if p is None or p[0] is None or p[1] is None:
+                continue
+            out.append((ec.EV_ABS, ec.ABS_MT_SLOT, slot))
+            if slot not in self.relay_pre:
+                out.append((ec.EV_ABS, ec.ABS_MT_TRACKING_ID,
+                            self.down[slot]))
+            out.append((ec.EV_ABS, ec.ABS_MT_POSITION_X, p[0]))
+            out.append((ec.EV_ABS, ec.ABS_MT_POSITION_Y, p[1]))
+        for code, value in self.real_abs.items():
+            out.append((ec.EV_ABS, code, value))
+        for code, value in self.real_keys.items():
+            if self.key_state.get(code, 0) != value:
+                out.append((ec.EV_KEY, code, value))
+        if out:
+            self._emit(out)
         self.relay_buf = []
         self.relay_pre = set()
 
@@ -1367,7 +1402,7 @@ class TrackpadEngine(GestureEngine):
                 log.info("trackpad 4-finger swipe -> %s", action)
                 self.pinch_action(action, None)
                 return
-        self._relay_replay()
+        self._relay_catchup()
         self.sub = "pass"
 
     def _pinch_fire(self, key):
