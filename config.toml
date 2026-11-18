@@ -1,0 +1,42 @@
+# niri-touch-gestures configuration
+# All values shown are the defaults; delete anything you don't want to change.
+
+[device]
+# Substring of the touchscreen's device name. Empty = auto-detect the first
+# direct-touch multitouch device (your Surface: "MELF0411:00 1FD2:9005").
+name = ""
+# "auto" asks niri for the output rotation. If swipes feel rotated after you
+# rotate the screen, force one of: "normal", "90", "180", "270",
+# "flipped", "flipped-90", "flipped-180", "flipped-270".
+transform = "auto"
+
+[gestures]
+# All distances are physical millimeters on the glass, so gestures have the
+# same travel as on the trackpad.
+deadzone_mm = 6.0        # travel before the swipe direction is decided
+trigger_mm = 28.0        # first step of a 3-finger swipe
+repeat_mm = 36.0         # each further step while you keep swiping
+overview_mm = 22.0       # first step of a 4-finger swipe
+flick_min_mm = 8.0       # a short...
+flick_speed_mm_s = 130.0 # ...but fast flick also counts as one step
+
+# Directions below are the direction YOUR FINGERS move. The defaults are
+# "direct manipulation": the canvas follows your fingers, like scrolling on a
+# phone — swipe left to reveal the column on the right, swipe down to go to
+# the workspace above. Swap the pairs if you prefer the opposite.
+# Any `niri msg action ...` works here; "" disables a direction.
+
+[actions]
+command = "niri msg action"
+
+[actions.three]
+left = "focus-column-right"
+right = "focus-column-left"
+up = "focus-workspace-down"
+down = "focus-workspace-up"
+
+[actions.four]
+up = "open-overview"
+down = "close-overview"
+left = ""
+right = ""
