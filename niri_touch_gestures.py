@@ -71,10 +71,18 @@ DEFAULT_CONFIG = {
         "scale_overview": 1.0,
         # Travel before a swipe engages / its axis is decided (mm).
         "deadzone_mm": 6.0,
-        # Hold 3 fingers still for this long (ms) to pick up the window
-        # under them and move it, exactly like Mod+drag with the mouse.
-        # 0 disables. Native mode only.
-        "hold_ms": 300,
+        # Hold 3 fingers for this long (ms) to pick up the window under
+        # them and move it (4 fingers: resize), exactly like Mod+drag with
+        # the mouse. 0 disables. Native mode only. Holds don't need to be
+        # still: anything slower than a deliberate swipe counts as holding
+        # (see hold_still_mm and swipe_min_speed_mm_s).
+        "hold_ms": 180,
+        # Fingers may wander this far (mm) without resetting the hold timer.
+        "hold_still_mm": 6.0,
+        # A swipe engages at deadzone_mm only when the fingers move at least
+        # this fast (mm/s); slower motion engages at twice the deadzone.
+        # Keeps slow drifting fingers from stealing the gesture from a hold.
+        "swipe_min_speed_mm_s": 30.0,
         # While moving a window, parking the drag within this many mm of the
         # top/bottom screen edge switches to the workspace above/below
         # (after move_edge_delay_ms, repeating every move_edge_repeat_ms).
@@ -150,15 +158,15 @@ DEFAULT_CONFIG = {
         },
         # Taps -> niri actions ("" disables).
         "tap": {
-            "five": "spawn vicinae toggle",
+            "five": "spawn noctalia msg panel-toggle launcher",
             "three_double": "toggle-window-floating",
         },
         # Edge strips -> commands (not niri actions), run once per step.
         "strip": {
-            "right_up": "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%+",
-            "right_down": "wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-",
-            "left_up": "brightnessctl set 3%+",
-            "left_down": "brightnessctl set 3%-",
+            "right_up": "noctalia msg volume-up",
+            "right_down": "noctalia msg volume-down",
+            "left_up": "noctalia msg brightness-up",
+            "left_down": "noctalia msg brightness-down",
         },
     },
 }
@@ -692,11 +700,12 @@ class GestureEngine:
                 self.acc = [0.0, 0.0]
                 self.pinch_acc = 0.0
                 self.still_anchor = (0.0, 0.0, 0.0)
-        # Stillness anchor: a hold fires once the fingers stop moving for
-        # hold_ms, wherever they stopped.
+        # Stillness anchor: a hold fires once the fingers stay roughly in
+        # place for hold_ms, wherever they ended up.
+        tol = float(g.get("hold_still_mm", 6.0) or 6.0)
         ax, ay, ap = self.still_anchor
-        if math.hypot(self.acc[0] - ax, self.acc[1] - ay) > 3.0 or \
-                abs(self.pinch_acc - ap) > 3.0:
+        if math.hypot(self.acc[0] - ax, self.acc[1] - ay) > tol or \
+                abs(self.pinch_acc - ap) > tol:
             self.still_anchor = (self.acc[0], self.acc[1], self.pinch_acc)
             self.still_since = now
 
@@ -717,7 +726,17 @@ class GestureEngine:
                     and self.pinch_acc >= 0.6 * travel:
                 self._pinch_fire(f"out{n}")
                 return
-        if travel >= g["deadzone_mm"] and travel >= 1.2 * abs(self.pinch_acc):
+        # Swipes are quick, deliberate motions; slow drift stays holdable.
+        speed = 0.0
+        if len(self.samples) >= 2:
+            t0s, x0s, y0s = self.samples[0]
+            t1s, x1s, y1s = self.samples[-1]
+            dt = max(t1s - t0s, 1e-4)
+            speed = math.hypot(x1s - x0s, y1s - y0s) / dt
+        fast = speed >= float(g.get("swipe_min_speed_mm_s", 30.0) or 0)
+        if travel >= g["deadzone_mm"] and (fast or
+                                           travel >= 2 * g["deadzone_mm"]) \
+                and travel >= 1.2 * abs(self.pinch_acc):
             self._engage_swipe(g)
             return
         self._check_hold(g)

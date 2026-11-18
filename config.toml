@@ -34,11 +34,17 @@ scale_overview = 1.0
 deadzone_mm = 6.0        # travel before a gesture engages (both modes)
 
 # Window gestures (native mode only):
-# Hold 3 fingers still on a window for this long (ms) to pick it up and
-# move it (Mod+left drag); hold 4 fingers to resize it (Mod+right drag).
-# 0 disables. The hold arms whenever the fingers settle, so landing wiggle
-# doesn't prevent the grab.
-hold_ms = 300
+# Hold 3 fingers on a window for this long (ms) to pick it up and move it
+# (Mod+left drag); hold 4 fingers to resize it (Mod+right drag).
+# 0 disables. Holds don't need stillness: anything slower than a
+# deliberate swipe counts as holding.
+hold_ms = 180
+# Fingers may wander this far (mm) without resetting the hold timer.
+hold_still_mm = 6.0
+# A swipe engages at deadzone_mm only when moving at least this fast
+# (mm/s); slower motion engages at twice the deadzone, so drifting
+# fingers don't steal the gesture from a hold.
+swipe_min_speed_mm_s = 30.0
 # While moving a window, parking it within this many mm of the top/bottom
 # screen edge switches to the workspace above/below after
 # move_edge_delay_ms, repeating every move_edge_repeat_ms (0 disables).
@@ -112,12 +118,14 @@ out5 = ""
 
 # Taps -> niri actions ("" disables).
 [actions.tap]
-five = "spawn vicinae toggle"
+five = "spawn noctalia msg panel-toggle launcher"
 three_double = "toggle-window-floating"
 
 # Edge strips -> shell commands (not niri actions), run once per step.
+# noctalia shows its OSD; raw alternatives: "wpctl set-volume ..." /
+# "brightnessctl set ...".
 [actions.strip]
-right_up = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%+"
-right_down = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-"
-left_up = "brightnessctl set 3%+"
-left_down = "brightnessctl set 3%-"
+right_up = "noctalia msg volume-up"
+right_down = "noctalia msg volume-down"
+left_up = "noctalia msg brightness-up"
+left_down = "noctalia msg brightness-down"

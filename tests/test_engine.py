@@ -723,9 +723,35 @@ def test_five_tap():
     for s in range(5):
         dev.up(s)
     engine.process_frame(dev.frame())
-    assert engine._closed == [("spawn vicinae toggle", None)], \
-        f"five tap: {engine._closed}"
+    assert engine._closed == [("spawn noctalia msg panel-toggle launcher",
+                               None)], f"five tap: {engine._closed}"
     print("ok  5-finger tap opens the launcher")
+
+
+def test_slow_drift_still_holds():
+    """Slow finger drift must arm the hold, not engage a swipe."""
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(clock, mode="native", calib=CAL)
+    dev = FakeTouch()
+    pts = [(1000, 900), (1200, 900), (1400, 1100)]
+    for s, (x, y) in enumerate(pts):
+        dev.down(s, x, y)
+    engine.process_frame(dev.frame())
+    # drift right at ~20 mm/s (1.2 mm per 60 ms frame)
+    for i in range(1, 5):
+        clock.t += 0.06
+        for s, (x, y) in enumerate(pts):
+            dev.move(s, x + int(mm(1.2)) * i, y)
+        engine.process_frame(dev.frame())
+    assert engine.sub == "move", \
+        f"drift should become a hold, got sub={engine.sub}"
+    ptr = flat_events(engine._ptr_events)
+    assert (ec.EV_KEY, ec.BTN_LEFT, 1) in ptr
+    assert engine._pad_events == [], "no swipe may engage"
+    for s in range(3):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    print("ok  slow drift arms the hold instead of swiping")
 
 
 def test_three_double_tap():
@@ -861,6 +887,7 @@ def main():
         test_move_edge_zones,
         test_hold4_resize,
         test_five_tap,
+        test_slow_drift_still_holds,
         test_three_double_tap,
         test_five_pinch_screenshot,
         test_strip_volume_and_replay,
