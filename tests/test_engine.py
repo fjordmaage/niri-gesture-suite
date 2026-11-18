@@ -79,16 +79,27 @@ class FakeTouch:
         return out
 
 
-def make_engine(clock):
+PAD_GEOM = {"cx": 2560, "cy": 1790, "xmax": 5119, "ymax": 3579}
+
+
+def make_engine(clock, mode="discrete"):
+    import copy
+    cfg = copy.deepcopy(ntg.DEFAULT_CONFIG)
+    cfg["gestures"]["mode"] = mode
     emitted = []
     acts = []
+    pad_events = []
     engine = ntg.GestureEngine(
-        ntg.DEFAULT_CONFIG,
+        cfg,
         emit=lambda evs: emitted.append(list(evs)),
         act=lambda n, d: acts.append((n, d)),
         mm_x=RES, mm_y=RES,
         transform_getter=lambda: "normal",
+        emit_pad=(lambda evs: pad_events.append(list(evs)))
+                 if mode == "native" else None,
+        pad_geom=PAD_GEOM if mode == "native" else None,
     )
+    engine._pad_events = pad_events
     return engine, emitted, acts
 
 
@@ -312,6 +323,109 @@ def test_clone_cache_resync():
     print("ok  clone position cache resynced after swallowed gesture")
 
 
+def test_native_mirror_lifecycle():
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(clock, mode="native")
+    pad = engine._pad_events
+    dev = FakeTouch()
+
+    dev.down(0, 1000, 1000)
+    engine.process_frame(dev.frame())
+    dev.down(1, 1200, 1000)
+    engine.process_frame(dev.frame())
+    dev.down(2, 1400, 1000)
+    engine.process_frame(dev.frame())
+    assert pad == [], "pad must stay quiet before the deadzone"
+
+    # move right 10 mm -> mirror engages
+    for i in range(1, 5):
+        clock.t += 0.01
+        for s in range(3):
+            dev.move(s, 1000 + s * 200 + mm(2.5) * i, 1000)
+        engine.process_frame(dev.frame())
+    down, pos, keys = clone_state(pad)
+    assert len(down) == 3, f"3 mirrored contacts expected: {down}"
+    assert keys.get(ec.BTN_TOUCH) == 1
+    assert keys.get(ec.BTN_TOOL_TRIPLETAP) == 1
+    # mirrored contacts are recentered around the pad center at engage;
+    # by now we are (10 mm - engage point) past it, well under the deadzone
+    cx = sum(p[0] for p in pos.values() if p[0] is not None) / 3
+    assert abs(cx - PAD_GEOM["cx"]) <= mm(4), f"centroid {cx} far from center"
+
+    # keep moving 20 mm -> pad centroid follows 1:1
+    for i in range(1, 9):
+        clock.t += 0.01
+        for s in range(3):
+            dev.move(s, 1000 + s * 200 + mm(10) + mm(2.5) * i, 1000)
+        engine.process_frame(dev.frame())
+    down, pos, keys = clone_state(pad)
+    cx2 = sum(pos[s][0] for s in down) / 3
+    assert abs((cx2 - cx) - mm(20)) <= 2, f"pad moved {cx2 - cx}, expected {mm(20)}"
+
+    # release -> everything lifted cleanly
+    for s in range(3):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    down, pos, keys = clone_state(pad)
+    assert not down, f"pad contacts must lift on release: {down}"
+    assert keys.get(ec.BTN_TOUCH) == 0
+    assert keys.get(ec.BTN_TOOL_TRIPLETAP) == 0
+    assert acts == [], "native mode must not fire discrete actions"
+
+    # clone (apps) saw only the cancel of the first two fingers, no gesture
+    cdown, _, ckeys = clone_state(emitted)
+    assert not cdown and ckeys.get(ec.BTN_TOUCH) == 0
+    print("ok  native mode mirrors 1:1 onto virtual touchpad")
+
+
+def test_native_below_deadzone_quiet():
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(clock, mode="native")
+    dev = FakeTouch()
+    for s in range(3):
+        dev.down(s, 1000 + s * 200, 1000)
+    engine.process_frame(dev.frame())
+    clock.t += 0.2
+    for s in range(3):
+        dev.move(s, 1000 + s * 200 + mm(3), 1000)
+    engine.process_frame(dev.frame())
+    for s in range(3):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    assert engine._pad_events == [], "sub-deadzone rest must not touch the pad"
+    print("ok  native mode: 3-finger rest never reaches the pad")
+
+
+def test_native_finger_count_transition():
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(clock, mode="native")
+    pad = engine._pad_events
+    dev = FakeTouch()
+    for s in range(3):
+        dev.down(s, 1000 + s * 200, 1500)
+    engine.process_frame(dev.frame())
+    for i in range(1, 5):
+        clock.t += 0.01
+        for s in range(3):
+            dev.move(s, 1000 + s * 200, 1500 - mm(2.5) * i)
+        engine.process_frame(dev.frame())
+    down, pos, keys = clone_state(pad)
+    assert keys.get(ec.BTN_TOOL_TRIPLETAP) == 1
+    # 4th finger joins mid-gesture
+    dev.down(3, 1600, 1500 - mm(10))
+    engine.process_frame(dev.frame())
+    down, pos, keys = clone_state(pad)
+    assert len(down) == 4, f"4 contacts expected: {down}"
+    assert keys.get(ec.BTN_TOOL_TRIPLETAP) == 0
+    assert keys.get(ec.BTN_TOOL_QUADTAP) == 1
+    for s in range(4):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    down, pos, keys = clone_state(pad)
+    assert not down and keys.get(ec.BTN_TOOL_QUADTAP) == 0
+    print("ok  native mode: 3->4 finger transition updates BTN_TOOL_*")
+
+
 def main():
     real_monotonic = time.monotonic
     clock = FakeClock()
@@ -324,6 +438,9 @@ def main():
         test_flick,
         test_deadzone_no_fire,
         test_clone_cache_resync,
+        test_native_mirror_lifecycle,
+        test_native_below_deadzone_quiet,
+        test_native_finger_count_transition,
     ]
     failures = 0
     for t in tests:

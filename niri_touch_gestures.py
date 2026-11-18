@@ -30,7 +30,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 import evdev
-from evdev import InputDevice, UInput, ecodes as ec
+from evdev import AbsInfo, InputDevice, UInput, ecodes as ec
 
 log = logging.getLogger("niri-touch-gestures")
 
@@ -50,7 +50,16 @@ DEFAULT_CONFIG = {
         "fallback_height_mm": 190.0,
     },
     "gestures": {
-        # Travel before a swipe's axis is decided (mm).
+        # "native": mirror 3/4-finger touches onto a virtual touchpad so
+        # niri's own continuous gesture handling takes over (1:1 tracking,
+        # release velocity, rubber-banding — identical to the real trackpad).
+        # "discrete": interpret swipes in the daemon and fire the [actions]
+        # below in steps (allows arbitrary mappings).
+        "mode": "native",
+        # Multiplier on finger travel in native mode (1.0 = same physical
+        # distance as the trackpad).
+        "gesture_scale": 1.0,
+        # Travel before a swipe engages / its axis is decided (mm).
         "deadzone_mm": 6.0,
         # Travel for the first step of a 3-finger swipe (mm).
         "trigger_mm": 28.0,
@@ -194,13 +203,18 @@ class GestureEngine:
     act(fingers, direction): fingers is 3 or 4; direction in l/r/u/d words.
     """
 
-    def __init__(self, cfg, emit, act, mm_x, mm_y, transform_getter):
+    def __init__(self, cfg, emit, act, mm_x, mm_y, transform_getter,
+                 emit_pad=None, pad_geom=None):
         self.cfg = cfg
         self.emit = emit
         self.act = act
         self.mm_x = mm_x  # units per mm
         self.mm_y = mm_y
         self.get_transform = transform_getter
+        # native mode: mirror gesture fingers onto a virtual touchpad
+        self.emit_pad = emit_pad
+        self.pad_geom = pad_geom  # {"cx","cy","xmax","ymax"} in pad raw units
+        self.pad_tid = 0         # ever-increasing tracking id for the pad
 
         self.mode = FORWARD
         # Protocol B is stateful: receivers must cache per-slot values,
@@ -227,6 +241,12 @@ class GestureEngine:
         self.prev_set = frozenset()
         self.samples = deque()   # (t, acc_x, acc_y)
         self.transform = TRANSFORMS["normal"]
+        # native-mode mirror state
+        self.engaged = False
+        self.centroid0 = None    # centroid (mm) when the mirror engaged
+        self.scale = 1.0
+        self.pad_map = {}        # real slot -> pad slot
+        self.cur_tool = None     # BTN_TOOL_* currently reported on the pad
 
     def _apply(self, events):
         """Apply a frame to the shadow state of the real device."""
@@ -356,6 +376,100 @@ class GestureEngine:
                 self.samples[-1][0] - self.samples[0][0] > 0.12:
             self.samples.popleft()
 
+        if g.get("mode", "native") == "native" and self.emit_pad is not None:
+            self._track_native(g)
+        else:
+            self._track_discrete(g)
+
+    # -- native mode: mirror onto the virtual touchpad ---------------------
+
+    def _track_native(self, g):
+        if not self.engaged:
+            if math.hypot(*self.acc) < g["deadzone_mm"]:
+                return
+            self.engaged = True
+            self.centroid0 = self.prev_centroid
+            self.scale = float(g.get("gesture_scale", 1.0)) or 1.0
+            self.fingers = len(self.down)
+            log.debug("native gesture engaged (%d fingers)", self.fingers)
+        self._pad_sync()
+
+    def _to_pad(self, x_raw, y_raw):
+        vx = x_raw / self.mm_x - self.centroid0[0]
+        vy = y_raw / self.mm_y - self.centroid0[1]
+        tx, ty = self.transform(vx, vy)
+        px = int(round(self.pad_geom["cx"] + tx * self.scale * self.mm_x))
+        py = int(round(self.pad_geom["cy"] + ty * self.scale * self.mm_y))
+        return (max(0, min(self.pad_geom["xmax"], px)),
+                max(0, min(self.pad_geom["ymax"], py)))
+
+    @staticmethod
+    def _tool_for(n):
+        return {1: ec.BTN_TOOL_FINGER, 2: ec.BTN_TOOL_DOUBLETAP,
+                3: ec.BTN_TOOL_TRIPLETAP, 4: ec.BTN_TOOL_QUADTAP,
+                }.get(n, ec.BTN_TOOL_QUINTTAP)
+
+    def _pad_sync(self):
+        """Diff real contacts against the mirrored ones and update the pad."""
+        out = []
+        active = {s: self.pos[s] for s in self.down
+                  if s in self.pos and self.pos[s][0] is not None
+                  and self.pos[s][1] is not None}
+        was_empty = not self.pad_map
+        # removals
+        for rs in [rs for rs in self.pad_map if rs not in active]:
+            out.append((ec.EV_ABS, ec.ABS_MT_SLOT, self.pad_map.pop(rs)))
+            out.append((ec.EV_ABS, ec.ABS_MT_TRACKING_ID, -1))
+        # additions and moves (the kernel drops unchanged ABS values)
+        used = set(self.pad_map.values())
+        first_pos = None
+        for rs in sorted(active):
+            px, py = self._to_pad(*active[rs])
+            if rs not in self.pad_map:
+                if len(self.pad_map) >= 6:
+                    continue  # pad has 6 slots; ignore further contacts
+                ps = next(i for i in range(6) if i not in used)
+                used.add(ps)
+                self.pad_map[rs] = ps
+                self.pad_tid += 1
+                out.append((ec.EV_ABS, ec.ABS_MT_SLOT, ps))
+                out.append((ec.EV_ABS, ec.ABS_MT_TRACKING_ID, self.pad_tid))
+            else:
+                out.append((ec.EV_ABS, ec.ABS_MT_SLOT, self.pad_map[rs]))
+            out.append((ec.EV_ABS, ec.ABS_MT_POSITION_X, px))
+            out.append((ec.EV_ABS, ec.ABS_MT_POSITION_Y, py))
+            if first_pos is None:
+                first_pos = (px, py)
+        # single-touch emulation + finger-count tools
+        if first_pos is not None:
+            out.append((ec.EV_ABS, ec.ABS_X, first_pos[0]))
+            out.append((ec.EV_ABS, ec.ABS_Y, first_pos[1]))
+        if was_empty and self.pad_map:
+            out.append((ec.EV_KEY, ec.BTN_TOUCH, 1))
+        tool = self._tool_for(len(self.pad_map)) if self.pad_map else None
+        if tool != self.cur_tool:
+            if self.cur_tool is not None:
+                out.append((ec.EV_KEY, self.cur_tool, 0))
+            if tool is not None:
+                out.append((ec.EV_KEY, tool, 1))
+            self.cur_tool = tool
+        if out:
+            self.emit_pad(out)
+
+    def _release_pad(self):
+        out = []
+        for ps in self.pad_map.values():
+            out.append((ec.EV_ABS, ec.ABS_MT_SLOT, ps))
+            out.append((ec.EV_ABS, ec.ABS_MT_TRACKING_ID, -1))
+        if self.cur_tool is not None:
+            out.append((ec.EV_KEY, self.cur_tool, 0))
+        out.append((ec.EV_KEY, ec.BTN_TOUCH, 0))
+        self.emit_pad(out)
+        log.debug("native gesture released")
+
+    # -- discrete mode: interpret swipes ourselves -------------------------
+
+    def _track_discrete(self, g):
         if self.axis is None:
             if math.hypot(*self.acc) >= g["deadzone_mm"]:
                 self.axis = "h" if abs(self.acc[0]) >= abs(self.acc[1]) else "v"
@@ -383,7 +497,9 @@ class GestureEngine:
 
     def _finalize(self):
         g = self.cfg["gestures"]
-        if self.axis is not None and not self.fired and len(self.samples) >= 2:
+        if self.engaged:
+            self._release_pad()
+        elif self.axis is not None and not self.fired and len(self.samples) >= 2:
             a_now = self.acc[0] if self.axis == "h" else self.acc[1]
             t0, x0, y0 = self.samples[0]
             t1 = self.samples[-1][0]
@@ -490,9 +606,51 @@ def run_device(dev, cfg, dry_run):
             ui.write(etype, code, value)
         ui.syn()
 
+    # In native mode, gestures are replayed on a virtual touchpad so that
+    # libinput + niri handle them with the exact same continuous physics as
+    # the real trackpad. Sized 2x the screen, with contacts recentered, so
+    # they never start in libinput's edge palm-detection zones nor run off.
+    pad = None
+    emit_pad = None
+    pad_geom = None
+    if cfg["gestures"].get("mode", "native") == "native" and not dry_run:
+        xi = dev.absinfo(ec.ABS_MT_POSITION_X)
+        yi = dev.absinfo(ec.ABS_MT_POSITION_Y)
+        pad_xmax = 2 * (xi.max - xi.min + 1) - 1
+        pad_ymax = 2 * (yi.max - yi.min + 1) - 1
+        res_x = max(1, int(round(mm_x)))
+        res_y = max(1, int(round(mm_y)))
+        caps = {
+            ec.EV_KEY: [ec.BTN_LEFT, ec.BTN_TOUCH, ec.BTN_TOOL_FINGER,
+                        ec.BTN_TOOL_DOUBLETAP, ec.BTN_TOOL_TRIPLETAP,
+                        ec.BTN_TOOL_QUADTAP, ec.BTN_TOOL_QUINTTAP],
+            ec.EV_ABS: [
+                (ec.ABS_MT_SLOT, AbsInfo(0, 0, 5, 0, 0, 0)),
+                (ec.ABS_MT_TRACKING_ID, AbsInfo(0, 0, 65535, 0, 0, 0)),
+                (ec.ABS_MT_POSITION_X, AbsInfo(0, 0, pad_xmax, 0, 0, res_x)),
+                (ec.ABS_MT_POSITION_Y, AbsInfo(0, 0, pad_ymax, 0, 0, res_y)),
+                (ec.ABS_X, AbsInfo(0, 0, pad_xmax, 0, 0, res_x)),
+                (ec.ABS_Y, AbsInfo(0, 0, pad_ymax, 0, 0, res_y)),
+            ],
+        }
+        pad = UInput(
+            caps, name=f"{VIRTUAL_NAME_SUFFIX} touchpad",
+            input_props=[ec.INPUT_PROP_POINTER, ec.INPUT_PROP_BUTTONPAD],
+        )
+        pad_geom = {"cx": pad_xmax // 2, "cy": pad_ymax // 2,
+                    "xmax": pad_xmax, "ymax": pad_ymax}
+        log.info("virtual touchpad created (%.0f x %.0f mm)",
+                 (pad_xmax + 1) / mm_x, (pad_ymax + 1) / mm_y)
+
+        def emit_pad(events):
+            for etype, code, value in events:
+                pad.write(etype, code, value)
+            pad.syn()
+
     engine = GestureEngine(
         cfg, emit, ActionRunner(cfg, dry_run), mm_x, mm_y,
         TransformCache(cfg["device"]["transform"]).get,
+        emit_pad=emit_pad, pad_geom=pad_geom,
     )
 
     dev.grab()
@@ -517,6 +675,8 @@ def run_device(dev, cfg, dry_run):
         dev.close()
         if ui is not None:
             ui.close()
+        if pad is not None:
+            pad.close()
 
 
 def main(argv=None):

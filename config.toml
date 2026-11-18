@@ -11,15 +11,27 @@ name = ""
 transform = "auto"
 
 [gestures]
-# All distances are physical millimeters on the glass, so gestures have the
-# same travel as on the trackpad.
-deadzone_mm = 6.0        # travel before the swipe direction is decided
+# "native" (default): 3/4-finger touches are replayed on a virtual touchpad,
+# so niri's own continuous gesture handling takes over — the view moves 1:1
+# with your fingers and animates with release velocity, exactly like the
+# trackpad. Your niri touchpad settings (natural-scroll etc.) apply.
+# "discrete": the daemon interprets swipes itself and fires the [actions]
+# below in steps — use this if you want custom mappings.
+mode = "native"
+# Native mode: multiplier on finger travel (1.0 = same physical distance as
+# the trackpad; try 1.5 if screen swipes should need less finger travel).
+gesture_scale = 1.0
+
+# All distances are physical millimeters on the glass.
+deadzone_mm = 6.0        # travel before a gesture engages (both modes)
+# The rest applies to discrete mode only:
 trigger_mm = 28.0        # first step of a 3-finger swipe
 repeat_mm = 36.0         # each further step while you keep swiping
 overview_mm = 22.0       # first step of a 4-finger swipe
 flick_min_mm = 8.0       # a short...
 flick_speed_mm_s = 130.0 # ...but fast flick also counts as one step
 
+# The [actions] tables are used in discrete mode only.
 # Directions below are the direction YOUR FINGERS move. The defaults are
 # "direct manipulation": the canvas follows your fingers, like scrolling on a
 # phone — swipe left to reveal the column on the right, swipe down to go to
