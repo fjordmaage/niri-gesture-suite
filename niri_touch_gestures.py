@@ -97,12 +97,13 @@ DEFAULT_CONFIG = {
         "double_tap_ms": 400,
         # 1-finger edge strips: a touch starting within strip_mm of the
         # left/right screen edge and dragging vertically (strip_arm_mm to
-        # arm) adjusts brightness/volume, one step per strip_step_mm.
+        # arm) slides brightness/volume as an absolute fader: strip_range_mm
+        # of travel covers the full 0-100 range from the current level.
         # Taps and horizontal swipes in the zone are passed through to apps
         # after at most strip_timeout_ms. 0 disables.
         "strip_mm": 4.0,
         "strip_arm_mm": 5.0,
-        "strip_step_mm": 3.0,
+        "strip_range_mm": 80.0,
         "strip_timeout_ms": 250,
         # Pinch 3 fingers together by this many mm (mean contact distance
         # from the centroid) to trigger the in3 pinch action (close the
@@ -159,14 +160,22 @@ DEFAULT_CONFIG = {
         # Taps -> niri actions ("" disables).
         "tap": {
             "five": "spawn noctalia msg panel-toggle launcher",
+            "four": "spawn noctalia msg media toggle",
             "three_double": "toggle-window-floating",
         },
-        # Edge strips -> commands (not niri actions), run once per step.
+        # 4-finger horizontal swipes -> actions (vertical stays the native
+        # Overview gesture). Directions are finger motion.
+        "swipe4": {
+            "left": "spawn noctalia msg media next",
+            "right": "spawn noctalia msg media previous",
+        },
+        # Edge strips: <side>_get prints the current level (percent or
+        # 0..1 fraction); <side>_set receives the target level for {}.
         "strip": {
-            "right_up": "noctalia msg volume-up",
-            "right_down": "noctalia msg volume-down",
-            "left_up": "noctalia msg brightness-up",
-            "left_down": "noctalia msg brightness-down",
+            "right_get": "wpctl get-volume @DEFAULT_AUDIO_SINK@",
+            "right_set": "noctalia msg volume-set {}",
+            "left_get": "brightnessctl -m",
+            "left_set": "noctalia msg brightness-set {}",
         },
     },
 }
@@ -409,7 +418,7 @@ class GestureEngine:
                  emit_pad=None, pad_geom=None, calib=None,
                  emit_ptr=None, emit_kbd=None,
                  window_at=None, pinch_action=None, move_edge=None,
-                 strip_run=None):
+                 strip_get=None, strip_set=None):
         self.cfg = cfg
         self.emit = emit
         self.act = act
@@ -430,14 +439,19 @@ class GestureEngine:
         self.window_at = window_at    # (nx, ny) -> window id or None
         self.pinch_action = pinch_action  # (action str, window id or None)
         self.move_edge = move_edge    # ("up"|"down") -> () while dragging
-        self.strip_run = strip_run    # ("left"|"right", "up"|"down") -> ()
+        self.strip_get = strip_get    # ("left"|"right") -> level 0..100
+        self.strip_set = strip_set    # ("left"|"right", level) -> ()
         self.last_tap3 = 0.0          # time of the last 3-finger tap
         # edge-strip state
         self.strip_side = None
         self.strip_buf = []
         self.strip_t0 = 0.0
         self.strip_start = None       # (x_mm, y_mm) logical at touchdown
-        self.strip_ref = 0.0          # y_mm reference for step firing
+        self.strip_ref = 0.0          # y_mm where the fader armed
+        self.strip_base = 50.0        # level when the fader armed
+        self.strip_val = None         # latest computed level
+        self.strip_sent = None        # last level actually sent
+        self.strip_last_send = 0.0
         self.move_key = MODIFIER_KEYS.get(
             str(cfg["gestures"].get("move_modifier", "Super")).lower(),
             ec.KEY_LEFTMETA)
@@ -742,6 +756,17 @@ class GestureEngine:
         self._check_hold(g)
 
     def _engage_swipe(self, g):
+        # Horizontal 4-finger swipes are media gestures (niri's own 4-finger
+        # gesture is the vertical Overview one; horizontal does nothing).
+        if len(self.down) == 4 and abs(self.acc[0]) > abs(self.acc[1]) \
+                and self.pinch_action is not None:
+            swipe4 = (self.cfg.get("actions") or {}).get("swipe4") or {}
+            action = swipe4.get("left" if self.acc[0] < 0 else "right", "")
+            if action:
+                self.sub = "done"
+                log.info("4-finger horizontal swipe -> %s", action)
+                self.pinch_action(action, None)
+                return
         self.sub = "swipe"
         self.engaged = True
         self.centroid0 = self.prev_centroid
@@ -806,7 +831,7 @@ class GestureEngine:
         """If the new single touch starts in an edge strip, capture it."""
         g = self.cfg["gestures"]
         zone = float(g.get("strip_mm", 0) or 0)
-        if zone <= 0 or self.strip_run is None:
+        if zone <= 0 or self.strip_set is None:
             return False
         self.transform_name = self.get_transform()
         self.transform = TRANSFORMS.get(self.transform_name,
@@ -863,18 +888,28 @@ class GestureEngine:
         if abs(dy) >= arm and abs(dy) > 2.0 * abs(dx):
             self.strip_buf = []
             self.strip_ref = pos[1]
+            base = None
+            if self.strip_get is not None:
+                base = self.strip_get(self.strip_side)
+            self.strip_base = base if base is not None else 50.0
+            self.strip_val = None
+            self.strip_sent = None
+            self.strip_last_send = 0.0
             self.mode = STRIP
-            log.info("edge strip armed: %s", self.strip_side)
+            log.info("edge strip armed: %s at %.0f%%",
+                     self.strip_side, self.strip_base)
         elif abs(dx) >= arm:
             self._strip_exit(replay=True)  # horizontal: not a strip
 
     def _strip_track(self, count):
         if count == 0:
+            self._strip_flush(final=True)
             self.strip_side = None
             self.mode = FORWARD
             self.resync = True
             return
         if count >= 2:
+            self._strip_flush(final=True)
             self.strip_side = None
             self.mode = DRAIN
             return
@@ -882,14 +917,22 @@ class GestureEngine:
         if pos is None:
             return
         g = self.cfg["gestures"]
-        step = float(g.get("strip_step_mm", 3.0) or 3.0)
+        rng = float(g.get("strip_range_mm", 80.0) or 80.0)
         d = self.strip_ref - pos[1]  # moving up is positive
-        n = int(d / step)
-        if n:
-            self.strip_ref -= n * step
-            direction = "up" if n > 0 else "down"
-            for _ in range(min(abs(n), 10)):
-                self.strip_run(self.strip_side, direction)
+        val = max(0.0, min(100.0, self.strip_base + d * 100.0 / rng))
+        self.strip_val = int(round(val))
+        self._strip_flush(final=False)
+
+    def _strip_flush(self, final):
+        """Send the fader level, rate-limited; always send the last value."""
+        if self.strip_val is None or self.strip_val == self.strip_sent:
+            return
+        now = time.monotonic()
+        if not final and now - self.strip_last_send < 0.05:
+            return
+        self.strip_sent = self.strip_val
+        self.strip_last_send = now
+        self.strip_set(self.strip_side, self.strip_val)
 
     def _spread_mm(self):
         """Mean distance of the contacts from their centroid, in mm."""
@@ -939,9 +982,14 @@ class GestureEngine:
         self.fingers = len(self.down)
         self.ptr_pos = [pos[0] * PTR_RANGE, pos[1] * PTR_RANGE]
         self.last_acc = (self.acc[0], self.acc[1])
+        # The warp, the modifier, and the button come from two different
+        # virtual devices; without pauses libinput may process the click
+        # before the modifier, turning the grab into a plain click.
         self.emit_ptr([(ec.EV_ABS, ec.ABS_X, int(round(self.ptr_pos[0]))),
                        (ec.EV_ABS, ec.ABS_Y, int(round(self.ptr_pos[1])))])
+        time.sleep(0.04)
         self.emit_kbd([(ec.EV_KEY, self.move_key, 1)])
+        time.sleep(0.04)
         self.emit_ptr([(ec.EV_KEY, button, 1)])
         log.info("window %s begin",
                  "move" if button == ec.BTN_LEFT else "resize")
@@ -1001,6 +1049,7 @@ class GestureEngine:
 
     def _move_end(self):
         self.emit_ptr([(ec.EV_KEY, self.move_btn, 0)])
+        time.sleep(0.02)
         self.emit_kbd([(ec.EV_KEY, self.move_key, 0)])
         log.info("window move/resize end")
 
@@ -1123,6 +1172,11 @@ class GestureEngine:
             action = taps.get("five", "")
             if action:
                 log.info("5-finger tap -> %s", action)
+                self.pinch_action(action, None)
+        elif self.max_count == 4:
+            action = taps.get("four", "")
+            if action:
+                log.info("4-finger tap -> %s", action)
                 self.pinch_action(action, None)
         elif self.max_count == 3:
             if (now - self.last_tap3) * 1000.0 <= \
@@ -1321,6 +1375,19 @@ def pinch_action(action, wid):
         log.error("pinch action %r failed: %s", action, exc)
 
 
+def parse_level(text):
+    """Extract a 0-100 level from command output: '37%' or a 0..1 fraction
+    like wpctl's 'Volume: 0.45'."""
+    m = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"\d+(?:\.\d+)?", text)
+    if m:
+        v = float(m.group(0))
+        return v * 100.0 if v <= 1.5 else v
+    return None
+
+
 def move_edge_action(direction):
     """Workspace switch while dragging a window to the top/bottom edge.
     Skipped in the Overview, where niri's own edge switching handles it."""
@@ -1472,16 +1539,31 @@ def run_device(dev, cfg, dry_run):
                 kbd.write(etype, code, value)
             kbd.syn()
 
-    def strip_run(side, direction):
-        cmd = ((cfg.get("actions") or {}).get("strip") or {}).get(
-            f"{side}_{direction}", "")
+    def strip_cfg(key):
+        return ((cfg.get("actions") or {}).get("strip") or {}).get(key, "")
+
+    def strip_get(side):
+        cmd = strip_cfg(f"{side}_get")
+        if not cmd:
+            return None
+        try:
+            out = subprocess.run(shlex.split(cmd), capture_output=True,
+                                 text=True, timeout=1)
+            return parse_level(out.stdout)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.warning("strip get %r failed: %s", cmd, exc)
+            return None
+
+    def strip_set(side, value):
+        cmd = strip_cfg(f"{side}_set")
         if not cmd:
             return
+        argv = [a.replace("{}", str(int(value))) for a in shlex.split(cmd)]
         try:
-            subprocess.Popen(shlex.split(cmd), stdout=subprocess.DEVNULL,
+            subprocess.Popen(argv, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
         except OSError as exc:
-            log.error("strip command %r failed: %s", cmd, exc)
+            log.error("strip set %r failed: %s", cmd, exc)
 
     engine = GestureEngine(
         cfg, emit, ActionRunner(cfg, dry_run), mm_x, mm_y,
@@ -1491,7 +1573,8 @@ def run_device(dev, cfg, dry_run):
         window_at=window_at if pad is not None else None,
         pinch_action=pinch_action if pad is not None else None,
         move_edge=move_edge_action if ptr is not None else None,
-        strip_run=strip_run if pad is not None else None,
+        strip_get=strip_get if pad is not None else None,
+        strip_set=strip_set if pad is not None else None,
     )
 
     dev.grab()

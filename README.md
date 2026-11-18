@@ -15,8 +15,10 @@ compositor — the same gestures you already use on the trackpad, on the glass.
 | 4-finger hold on a window (`window-gestures` branch) | resize the window (Mod+right-drag) |
 | 3-finger double tap (`window-gestures` branch) | toggle floating |
 | 5-finger tap (`window-gestures` branch) | open the launcher |
+| 4-finger tap (`window-gestures` branch) | play / pause |
+| 4-finger swipe left / right (`window-gestures` branch) | next / previous track |
 | 5-finger pinch (`window-gestures` branch) | screenshot UI |
-| 1-finger vertical drag on the right / left screen edge (`window-gestures` branch) | volume / brightness, one step per 3 mm; edge taps still reach apps |
+| 1-finger vertical drag on the right / left screen edge (`window-gestures` branch) | volume / brightness as an absolute fader (80 mm = full range); edge taps still reach apps |
 
 In the default **native mode** these are niri's *own* continuous gestures:
 the view moves 1:1 with your fingers and, on release, completes or snaps back

@@ -113,7 +113,8 @@ def make_engine(clock, mode="discrete", scales=(1.0, 1.0, 1.0), calib=None):
         pinch_action=(lambda a, wid: closed.append((a, wid)))
                      if native else None,
         move_edge=(lambda d: edge_moves.append(d)) if native else None,
-        strip_run=(lambda s, d: strips.append((s, d))) if native else None,
+        strip_get=(lambda s: 40.0) if native else None,
+        strip_set=(lambda s, v: strips.append((s, v))) if native else None,
     )
     engine._pad_events = pad_events
     engine._ptr_events = ptr_events
@@ -812,8 +813,12 @@ def test_strip_volume_and_replay():
         engine.process_frame(dev.frame())
     dev.up(0)
     engine.process_frame(dev.frame())
-    # arming consumes the first 6 mm; the remaining 8 mm -> 2 steps of 3 mm
-    assert engine._strips == [("right", "up")] * 2, f"got {engine._strips}"
+    # fader: base 40, armed after 6 mm, 8 mm more at 100/80 per mm -> 50
+    assert engine._strips, "fader must send levels"
+    assert all(s == "right" for s, v in engine._strips)
+    vals = [v for s, v in engine._strips]
+    assert vals == sorted(vals), f"levels must rise monotonically: {vals}"
+    assert vals[-1] == 50, f"final level 50 expected: {vals}"
     assert emitted == [], "strip touches must never reach apps"
 
     # a tap on the left edge is replayed to the app untouched
@@ -826,8 +831,43 @@ def test_strip_volume_and_replay():
     down, pos, keys = clone_state(emitted)
     assert pos.get(0) == [10, 1500], f"edge tap must replay: {pos}"
     assert keys.get(ec.BTN_TOUCH) == 0
-    assert len(engine._strips) == 2, "no extra strip events"
-    print("ok  right-edge drag adjusts volume; edge taps pass through")
+    assert [v for s, v in engine._strips][-1] == 50, "no extra strip events"
+    print("ok  right-edge fader slides volume; edge taps pass through")
+
+
+def test_four_tap_and_media_swipe():
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(clock, mode="native", calib=CAL)
+    dev = FakeTouch()
+    pts = [(1000, 900), (1200, 900), (1400, 1100), (1200, 700)]
+    # 4-finger tap -> play/pause
+    for s, (x, y) in enumerate(pts):
+        dev.down(s, x, y)
+    engine.process_frame(dev.frame())
+    clock.t += 0.12
+    for s in range(4):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    assert engine._closed == [("spawn noctalia msg media toggle", None)], \
+        f"four tap: {engine._closed}"
+
+    # fast 4-finger swipe left -> next track, and nothing reaches the pad
+    engine._closed.clear()
+    for s, (x, y) in enumerate(pts):
+        dev.down(s, x, y)
+    engine.process_frame(dev.frame())
+    for i in range(1, 6):
+        clock.t += 0.01
+        for s, (x, y) in enumerate(pts):
+            dev.move(s, x - mm(2.5) * i, y)
+        engine.process_frame(dev.frame())
+    for s in range(4):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    assert engine._closed == [("spawn noctalia msg media next", None)], \
+        f"swipe4 left: {engine._closed}"
+    assert engine._pad_events == [], "media swipe must not reach the pad"
+    print("ok  4-finger tap toggles playback, swipe left skips track")
 
 
 def test_niri_config_parse():
@@ -891,6 +931,7 @@ def main():
         test_three_double_tap,
         test_five_pinch_screenshot,
         test_strip_volume_and_replay,
+        test_four_tap_and_media_swipe,
         test_niri_config_parse,
     ]
     failures = 0
