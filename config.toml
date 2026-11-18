@@ -12,6 +12,9 @@ enabled = true
 name = ""
 # Cursor speed while dragging a window from the trackpad.
 move_gain = 1.0
+# Travel before a trackpad gesture classifies (mm); smaller than the
+# touchscreen deadzone so native swipes start with minimal latency.
+deadzone_mm = 3.0
 
 [device]
 # Substring of the touchscreen's device name. Empty = auto-detect the first
@@ -138,8 +141,8 @@ three_double = "toggle-window-floating"
 # 4-finger horizontal swipes (vertical stays the native Overview gesture).
 # Directions are finger motion.
 [actions.swipe4]
-left = "spawn noctalia msg media next"
-right = "spawn noctalia msg media previous"
+left = "spawn noctalia msg media previous"
+right = "spawn noctalia msg media next"
 
 # Edge strips: <side>_get prints the current level (a percent like "37%"
 # or a 0..1 fraction like wpctl's "Volume: 0.45"); <side>_set receives the

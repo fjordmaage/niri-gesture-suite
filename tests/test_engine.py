@@ -864,10 +864,10 @@ def test_four_tap_and_media_swipe():
     for s in range(4):
         dev.up(s)
     engine.process_frame(dev.frame())
-    assert engine._closed == [("spawn noctalia msg media next", None)], \
+    assert engine._closed == [("spawn noctalia msg media previous", None)], \
         f"swipe4 left: {engine._closed}"
     assert engine._pad_events == [], "media swipe must not reach the pad"
-    print("ok  4-finger tap toggles playback, swipe left skips track")
+    print("ok  4-finger tap toggles playback, swipe left goes back a track")
 
 
 def make_tp_engine(clock):
@@ -1029,7 +1029,7 @@ def test_tp_hold_and_media_swipe():
     for s in range(4):
         dev.up(s)
     engine.process_frame(dev.frame())
-    assert engine._pinches == [("spawn noctalia msg media next", None)], \
+    assert engine._pinches == [("spawn noctalia msg media previous", None)], \
         f"media swipe: {engine._pinches}"
     assert len(engine._emitted) == n_fwd, "media swipe must be swallowed"
     print("ok  trackpad: hold drags via relative mouse, media swipe claims")

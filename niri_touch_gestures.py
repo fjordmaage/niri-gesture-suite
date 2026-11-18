@@ -48,6 +48,9 @@ DEFAULT_CONFIG = {
         "name": "",
         # Cursor speed while dragging a window from the trackpad.
         "move_gain": 1.0,
+        # Travel before a trackpad gesture classifies (mm). Smaller than the
+        # touchscreen deadzone so native swipes engage with less latency.
+        "deadzone_mm": 3.0,
     },
     "device": {
         # Substring or exact name of the touchscreen. Empty = auto-detect the
@@ -176,8 +179,8 @@ DEFAULT_CONFIG = {
         # 4-finger horizontal swipes -> actions (vertical stays the native
         # Overview gesture). Directions are finger motion.
         "swipe4": {
-            "left": "spawn noctalia msg media next",
-            "right": "spawn noctalia msg media previous",
+            "left": "spawn noctalia msg media previous",
+            "right": "spawn noctalia msg media next",
         },
         # Edge strips: <side>_get prints the current level (percent or
         # 0..1 fraction); <side>_set receives the target level for {}.
@@ -1289,10 +1292,15 @@ class TrackpadEngine(GestureEngine):
             if prefix:
                 self._emit(prefix)
             self.resync = False
-        for frame in self.relay_buf:
+        # Pace the frames slightly so libinput sees finite velocities
+        # instead of a zero-duration burst (capped at ~20 ms total).
+        pace = min(0.002, 0.02 / max(len(self.relay_buf), 1))
+        for i, frame in enumerate(self.relay_buf):
             evs = [(t, c, v) for t, c, v in frame if t != ec.EV_SYN]
             if evs:
                 self._emit(evs)
+                if i + 1 < len(self.relay_buf):
+                    time.sleep(pace)
         self.relay_buf = []
         self.relay_pre = set()
 
@@ -1902,8 +1910,11 @@ def make_trackpad_runner(dev, cfg, dry_run, shared):
     calib = {"u": libinput_units_per_mm("adaptive", 0.0),
              "w_mm": (xi.max - xi.min + 1) / mm_x,
              "h_mm": (yi.max - yi.min + 1) / mm_y}
+    tcfg = deep_merge(cfg, {"gestures": {
+        "deadzone_mm": float(cfg["trackpad"].get("deadzone_mm", 3.0) or 3.0),
+    }})
     engine = TrackpadEngine(
-        cfg, emit, mm_x, mm_y,
+        tcfg, emit, mm_x, mm_y,
         emit_kbd=shared["emit_kbd"], emit_rel=shared["emit_rel"],
         pinch_action=shared["trackpad_pinch"],
         calib=calib,
