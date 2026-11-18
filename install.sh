@@ -5,10 +5,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# --- detect the touchscreen name (direct-touch multitouch device) ----------
-TOUCH_NAME="$(python3 - <<'EOF'
+# --- detect touchscreen + touchpad names (multitouch devices) ---------------
+mapfile -t TOUCH_NAMES < <(python3 - <<'EOF'
 import re
 blocks = open("/proc/bus/input/devices").read().strip().split("\n\n")
+ts = tp = None
 for b in blocks:
     name = re.search(r'^N: Name="(.*)"', b, re.M)
     prop = re.search(r'^B: PROP=([0-9a-f ]+)$', b, re.M)
@@ -22,16 +23,23 @@ for b in blocks:
         return v
     if "niri-touch-gestures" in name.group(1):
         continue
-    if bits(prop.group(1)) & 0x2 and bits(absb.group(1)) & (1 << 0x2f):
-        print(name.group(1))
-        break
+    if not bits(absb.group(1)) & (1 << 0x2f):
+        continue  # not multitouch
+    p = bits(prop.group(1))
+    if p & 0x2 and ts is None:       # INPUT_PROP_DIRECT: touchscreen
+        ts = name.group(1)
+    elif p & 0x1 and tp is None:     # INPUT_PROP_POINTER: touchpad
+        tp = name.group(1)
+for n in (ts, tp):
+    if n:
+        print(n)
 EOF
-)"
-if [[ -z "$TOUCH_NAME" ]]; then
-    echo "ERROR: no touchscreen (direct multitouch device) found." >&2
+)
+if [[ ${#TOUCH_NAMES[@]} -eq 0 ]]; then
+    echo "ERROR: no touchscreen or touchpad (multitouch device) found." >&2
     exit 1
 fi
-echo "Touchscreen: $TOUCH_NAME"
+printf 'Devices: %s\n' "${TOUCH_NAMES[@]}"
 
 # --- user-level files -------------------------------------------------------
 install -Dm755 niri_touch_gestures.py "$HOME/.local/bin/niri-touch-gestures"
@@ -44,16 +52,19 @@ fi
 install -Dm644 niri-touch-gestures.service \
     "$HOME/.config/systemd/user/niri-touch-gestures.service"
 
-# --- udev rule (needs sudo once) -------------------------------------------
+# --- udev rules (needs sudo once) ------------------------------------------
 RULE="/etc/udev/rules.d/70-niri-touch-gestures.rules"
-RULE_TEXT="SUBSYSTEM==\"input\", KERNEL==\"event*\", ATTRS{name}==\"$TOUCH_NAME\", TAG+=\"uaccess\""
-if [[ ! -e "$RULE" ]] || ! grep -qF "$RULE_TEXT" "$RULE" 2>/dev/null; then
-    echo "Installing udev rule (sudo): $RULE"
-    echo "$RULE_TEXT" | sudo tee "$RULE" >/dev/null
+RULE_TEXT=""
+for name in "${TOUCH_NAMES[@]}"; do
+    RULE_TEXT+="SUBSYSTEM==\"input\", KERNEL==\"event*\", ATTRS{name}==\"$name\", TAG+=\"uaccess\""$'\n'
+done
+if [[ ! -e "$RULE" ]] || [[ "$(cat "$RULE" 2>/dev/null)" != "$(printf '%s' "$RULE_TEXT")" ]]; then
+    echo "Installing udev rules (sudo): $RULE"
+    printf '%s' "$RULE_TEXT" | sudo tee "$RULE" >/dev/null
     sudo udevadm control --reload
     sudo udevadm trigger --subsystem-match=input
 else
-    echo "udev rule already in place."
+    echo "udev rules already in place."
 fi
 
 # --- enable -----------------------------------------------------------------

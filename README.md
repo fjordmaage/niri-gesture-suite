@@ -26,6 +26,14 @@ with your release velocity — identical physics and identical physical travel
 to the trackpad. Normal 1- and 2-finger touch (taps, scrolling, pinch) keeps
 working exactly as before.
 
+On the `window-gestures` branch the extra gestures also run on the
+**trackpad**: pinches, 4/5-finger taps, 4-finger horizontal media swipes,
+and hold-to-move/resize at the mouse cursor (pinch-close targets the window
+under the cursor via a compositor-consumed Mod+click). Native niri
+3/4-finger trackpad swipes pass through untouched: 3+ finger input is
+buffered for a few milliseconds until classified, then either replayed to
+the virtual clone verbatim (a swipe) or claimed (a pinch, hold, or tap).
+
 ## Design
 
 Inspired by how Apple approached the touchscreen Mac: don't invent a new

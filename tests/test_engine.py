@@ -870,6 +870,171 @@ def test_four_tap_and_media_swipe():
     print("ok  4-finger tap toggles playback, swipe left skips track")
 
 
+def make_tp_engine(clock):
+    import copy
+    cfg = copy.deepcopy(ntg.DEFAULT_CONFIG)
+    emitted = []
+    rels = []
+    kbds = []
+    pinches = []
+    engine = ntg.TrackpadEngine(
+        cfg,
+        emit=lambda evs: emitted.append(list(evs)),
+        mm_x=RES, mm_y=RES,
+        emit_kbd=lambda evs: kbds.append(list(evs)),
+        emit_rel=lambda evs: rels.append(list(evs)),
+        pinch_action=lambda a, w: pinches.append((a, w)),
+        calib={"u": 10.0, "w_mm": 100.0, "h_mm": 60.0},
+        move_gain=1.0,
+    )
+    engine._emitted = emitted
+    engine._rels = rels
+    engine._kbds = kbds
+    engine._pinches = pinches
+    return engine
+
+
+def test_tp_swipe_replay():
+    """A fast 3-finger swipe reaches the clone verbatim (native niri)."""
+    clock = FakeClock()
+    engine = make_tp_engine(clock)
+    dev = FakeTouch()
+    dev.down(0, 300, 300)
+    engine.process_frame(dev.frame())   # forwarded live
+    dev.down(1, 500, 300)
+    engine.process_frame(dev.frame())
+    dev.down(2, 700, 300)               # buffering starts
+    engine.process_frame(dev.frame())
+    for i in range(1, 7):
+        clock.t += 0.01
+        for s in range(3):
+            dev.move(s, 300 + s * 200 + mm(2.5) * i, 300)
+        engine.process_frame(dev.frame())
+    down, pos, keys = clone_state(engine._emitted)
+    assert len(down) == 3, f"clone must see all 3 fingers: {down}"
+    assert pos[2][0] == 700 + mm(15), f"replayed positions wrong: {pos}"
+    for s in range(3):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    down, pos, keys = clone_state(engine._emitted)
+    assert not down and keys.get(ec.BTN_TOUCH) == 0
+    assert engine._pinches == [] and engine._rels == []
+    print("ok  trackpad: native swipe replays to the clone")
+
+
+def test_tp_pinch_claim():
+    """A pinch cancels the forwarded contacts and fires the action."""
+    clock = FakeClock()
+    engine = make_tp_engine(clock)
+    dev = FakeTouch()
+    base = [(300, 300), (700, 300), (500, 700)]
+    dev.down(0, *base[0])
+    engine.process_frame(dev.frame())   # forwarded: clone has 1 contact
+    dev.down(1, *base[1])
+    engine.process_frame(dev.frame())
+    dev.down(2, *base[2])
+    engine.process_frame(dev.frame())
+    cx = sum(p[0] for p in base) / 3
+    cy = sum(p[1] for p in base) / 3
+    for i in range(1, 10):
+        clock.t += 0.01
+        k = 1.0 - 0.1 * i
+        for s, (x, y) in enumerate(base):
+            dev.move(s, int(cx + (x - cx) * k), int(cy + (y - cy) * k))
+        engine.process_frame(dev.frame())
+    assert engine._pinches == [("close-window", None)], \
+        f"pinch: {engine._pinches}"
+    down, pos, keys = clone_state(engine._emitted)
+    assert not down, f"forwarded contacts must be cancelled: {down}"
+    assert keys.get(ec.BTN_TOUCH) == 0
+    for s in range(3):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    assert len(engine._pinches) == 1
+    print("ok  trackpad: pinch claims and cancels cleanly")
+
+
+def test_tp_taps():
+    clock = FakeClock()
+    engine = make_tp_engine(clock)
+    dev = FakeTouch()
+    # 4-finger tap -> play/pause, swallowed
+    for s, x in enumerate((300, 500, 700, 900)):
+        dev.down(s, x, 300)
+    engine.process_frame(dev.frame())
+    clock.t += 0.1
+    for s in range(4):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    assert engine._pinches == [("spawn noctalia msg media toggle", None)]
+    assert engine._emitted == [], "4-finger tap must be swallowed"
+
+    # 3-finger tap -> replayed so libinput's middle-click tap still works
+    engine._pinches.clear()
+    for s, x in enumerate((300, 500, 700)):
+        dev.down(s, x, 300)
+    engine.process_frame(dev.frame())
+    clock.t += 0.1
+    for s in range(3):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    assert engine._pinches == [], "3-finger tap is libinput's"
+    down, pos, keys = clone_state(engine._emitted)
+    assert not down and pos.get(0) == [300, 300], \
+        f"3-finger tap must replay: {pos}"
+    print("ok  trackpad: 4-tap claims, 3-tap replays for middle click")
+
+
+def test_tp_hold_and_media_swipe():
+    clock = FakeClock()
+    engine = make_tp_engine(clock)
+    dev = FakeTouch()
+    # hold -> Super + left button on the relative mouse, motion in REL
+    for s, x in enumerate((300, 500, 700)):
+        dev.down(s, x, 300)
+    engine.process_frame(dev.frame())
+    clock.t += 0.35
+    engine.tick()
+    kbd = flat_events(engine._kbds)
+    rel = flat_events(engine._rels)
+    assert (ec.EV_KEY, ntg.ec.KEY_LEFTMETA, 1) in kbd
+    assert (ec.EV_KEY, ec.BTN_LEFT, 1) in rel
+    for i in range(1, 5):
+        clock.t += 0.01
+        for s, x in enumerate((300, 500, 700)):
+            dev.move(s, x + mm(2.5) * i, 300)
+        engine.process_frame(dev.frame())
+    moved = sum(v for t, c, v in flat_events(engine._rels) if c == ec.REL_X)
+    exp = 10.0 * (1000.0 / 25.4)  # 10 mm in libinput-normalized units
+    assert abs(moved - exp) <= 2, f"REL motion {moved} != {exp:.0f}"
+    for s in range(3):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    rel = flat_events(engine._rels)
+    kbd = flat_events(engine._kbds)
+    assert (ec.EV_KEY, ec.BTN_LEFT, 0) in rel
+    assert (ec.EV_KEY, ntg.ec.KEY_LEFTMETA, 0) in kbd
+
+    # fast 4-finger horizontal swipe -> media next, swallowed
+    engine._pinches.clear()
+    n_fwd = len(engine._emitted)
+    for s, x in enumerate((300, 500, 700, 900)):
+        dev.down(s, x, 500)
+    engine.process_frame(dev.frame())
+    for i in range(1, 6):
+        clock.t += 0.01
+        for s, x in enumerate((300, 500, 700, 900)):
+            dev.move(s, x - mm(2.5) * i, 500)
+        engine.process_frame(dev.frame())
+    for s in range(4):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    assert engine._pinches == [("spawn noctalia msg media next", None)], \
+        f"media swipe: {engine._pinches}"
+    assert len(engine._emitted) == n_fwd, "media swipe must be swallowed"
+    print("ok  trackpad: hold drags via relative mouse, media swipe claims")
+
+
 def test_niri_config_parse():
     import tempfile
     sample = """
@@ -932,6 +1097,10 @@ def main():
         test_five_pinch_screenshot,
         test_strip_volume_and_replay,
         test_four_tap_and_media_swipe,
+        test_tp_swipe_replay,
+        test_tp_pinch_claim,
+        test_tp_taps,
+        test_tp_hold_and_media_swipe,
         test_niri_config_parse,
     ]
     failures = 0

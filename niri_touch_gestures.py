@@ -39,6 +39,16 @@ log = logging.getLogger("niri-touch-gestures")
 VIRTUAL_NAME_SUFFIX = "niri-touch-gestures virtual"
 
 DEFAULT_CONFIG = {
+    "trackpad": {
+        # Also run gestures on the trackpad: pinches, 4/5-finger taps,
+        # 4-finger horizontal media swipes, and hold-to-move/resize at the
+        # cursor. Native 3/4-finger niri swipes pass through untouched.
+        "enabled": True,
+        # Substring of the touchpad device name; empty = auto-detect.
+        "name": "",
+        # Cursor speed while dragging a window from the trackpad.
+        "move_gain": 1.0,
+    },
     "device": {
         # Substring or exact name of the touchscreen. Empty = auto-detect the
         # first direct-touch multitouch device.
@@ -1211,6 +1221,223 @@ class GestureEngine:
         self._reset_gesture()
 
 
+class TrackpadEngine(GestureEngine):
+    """Gesture engine profile for a real touchpad.
+
+    Unlike the touchscreen, niri's native 3/4-finger swipes must keep
+    working, so 3+ finger frames are buffered until classified: a swipe
+    replays the buffer to the clone verbatim (native gesture, tiny delay),
+    while pinches, holds, and 4/5-finger taps are claimed - the already
+    forwarded contacts are cancelled and the daemon acts. 1/2-finger input
+    (pointer, scroll, taps) is forwarded untouched. Holds drive a virtual
+    relative mouse, so the grab happens at the current cursor position.
+    """
+
+    def __init__(self, cfg, emit, mm_x, mm_y, emit_kbd=None, emit_rel=None,
+                 pinch_action=None, calib=None, move_gain=1.0):
+        super().__init__(
+            cfg, emit, act=lambda n, d: None, mm_x=mm_x, mm_y=mm_y,
+            transform_getter=lambda: "normal",
+            emit_pad=(lambda evs: None),  # routes _track to the native path
+            pad_geom=None, calib=calib,
+            emit_ptr=emit_rel, emit_kbd=emit_kbd,
+            window_at=None, pinch_action=pinch_action, move_edge=None,
+            strip_get=None, strip_set=None,
+        )
+        self.emit_rel = emit_rel
+        self.move_gain = move_gain
+        self.relay_buf = []
+        self.relay_pre = set()
+        self.relay_claimed = False
+        self.rel_rem = [0.0, 0.0]
+
+    # -- relay plumbing ----------------------------------------------------
+
+    def _relay_begin(self, pre_active, events):
+        self.mode = GESTURE
+        self._reset_gesture()
+        self.t0 = time.monotonic()
+        self.still_since = self.t0
+        self.max_count = len(self.down)
+        self.relay_buf = [list(events)]
+        self.relay_pre = set(pre_active)
+        self.relay_claimed = False
+        self._track()
+
+    def _relay_cancel(self):
+        """Claim the gesture: lift the contacts the clone still has down."""
+        out = []
+        for slot in sorted(self.relay_pre):
+            out.append((ec.EV_ABS, ec.ABS_MT_SLOT, slot))
+            out.append((ec.EV_ABS, ec.ABS_MT_TRACKING_ID, -1))
+        for code, value in list(self.key_state.items()):
+            if value:
+                out.append((ec.EV_KEY, code, 0))
+        if out:
+            self._emit(out)
+        self.relay_buf = []
+        self.relay_pre = set()
+        self.relay_claimed = True
+        self.resync = True
+
+    def _relay_replay(self):
+        """Not one of ours: hand the buffered frames to the clone."""
+        if self.resync:
+            # an earlier claimed gesture was swallowed; bring the clone's
+            # per-slot position caches up to date first
+            prefix = self._resync_prefix()
+            if prefix:
+                self._emit(prefix)
+            self.resync = False
+        for frame in self.relay_buf:
+            evs = [(t, c, v) for t, c, v in frame if t != ec.EV_SYN]
+            if evs:
+                self._emit(evs)
+        self.relay_buf = []
+        self.relay_pre = set()
+
+    def process_frame(self, events):
+        pre_active = set(self.down)
+        self._apply(events)
+        count = len(self.down)
+
+        if self.mode == FORWARD:
+            if count >= 3:
+                self._relay_begin(pre_active, events)
+            else:
+                self._forward(events)
+        elif self.mode == GESTURE:
+            self.max_count = max(self.max_count, count)
+            if self.sub == "move":
+                if count == 0:
+                    self._move_end()
+                    self._reset_gesture()
+                    self.mode = FORWARD
+                else:
+                    self._track()
+            elif self.sub == "pass":
+                self._forward(events)
+                if count == 0:
+                    self._reset_gesture()
+                    self.mode = FORWARD
+            elif count >= 3:
+                if self.sub == "pending":
+                    self.relay_buf.append(list(events))
+                self._track()
+            else:
+                if self.sub == "pending":
+                    self.relay_buf.append(list(events))
+                    self._finalize()  # _check_taps claims or replays
+                else:
+                    self._finalize()
+                if self.relay_claimed:
+                    self.relay_claimed = False
+                    self.mode = DRAIN if count > 0 else FORWARD
+                else:
+                    self.mode = FORWARD
+        elif self.mode == DRAIN:
+            if count == 0:
+                self.mode = FORWARD
+
+    # -- classification overrides ------------------------------------------
+
+    def _engage_swipe(self, g):
+        # 4-finger horizontal media swipes are ours; everything else is a
+        # native niri gesture: replay and step aside.
+        if len(self.down) == 4 and abs(self.acc[0]) > abs(self.acc[1]) \
+                and self.pinch_action is not None:
+            swipe4 = (self.cfg.get("actions") or {}).get("swipe4") or {}
+            action = swipe4.get("left" if self.acc[0] < 0 else "right", "")
+            if action:
+                self._relay_cancel()
+                self.sub = "done"
+                log.info("trackpad 4-finger swipe -> %s", action)
+                self.pinch_action(action, None)
+                return
+        self._relay_replay()
+        self.sub = "pass"
+
+    def _pinch_fire(self, key):
+        actions = (self.cfg.get("actions") or {}).get("pinch") or {}
+        action = actions.get(key, "")
+        self._relay_cancel()
+        self.sub = "done"
+        if not action or self.pinch_action is None:
+            return
+        log.info("trackpad pinch %s -> %s", key, action)
+        self.pinch_action(action, None)
+
+    def _check_taps(self, g):
+        """At gesture end: claim a 4/5-finger tap, else replay so native
+        libinput taps (e.g. 3-finger middle click) keep working."""
+        claimed = False
+        now = time.monotonic()
+        quick = (now - self.t0) * 1000.0 <= float(g.get("tap_ms", 250) or 250)
+        still = math.hypot(*self.acc) < g["deadzone_mm"] and \
+            abs(self.pinch_acc) < 5.0
+        if quick and still and self.pinch_action is not None:
+            taps = (self.cfg.get("actions") or {}).get("tap") or {}
+            if self.max_count >= 5 and taps.get("five"):
+                claimed = True
+                log.info("trackpad 5-finger tap -> %s", taps["five"])
+            elif self.max_count == 4 and taps.get("four"):
+                claimed = True
+                log.info("trackpad 4-finger tap -> %s", taps["four"])
+        if claimed:
+            action = taps["five"] if self.max_count >= 5 else taps["four"]
+            self._relay_cancel()
+            self.pinch_action(action, None)
+        else:
+            self._relay_replay()
+
+    # -- hold-to-move at the cursor (relative mouse) -----------------------
+
+    def _move_begin(self, button=ec.BTN_LEFT):
+        if self.emit_rel is None or self.emit_kbd is None:
+            return
+        self._relay_cancel()
+        self.sub = "move"
+        self.move_btn = button
+        self.fingers = len(self.down)
+        self.last_acc = (self.acc[0], self.acc[1])
+        self.rel_rem = [0.0, 0.0]
+        self.emit_kbd([(ec.EV_KEY, self.move_key, 1)])
+        time.sleep(0.04)
+        self.emit_rel([(ec.EV_KEY, button, 1)])
+        log.info("trackpad window %s begin",
+                 "move" if button == ec.BTN_LEFT else "resize")
+
+    def _move_update(self):
+        dx = self.acc[0] - self.last_acc[0]
+        dy = self.acc[1] - self.last_acc[1]
+        if not dx and not dy:
+            return
+        self.last_acc = (self.acc[0], self.acc[1])
+        # finger mm -> libinput-normalized units (1000 dpi equivalent)
+        self.rel_rem[0] += dx * LIBINPUT_UNITS_PER_INCH_MM * self.move_gain
+        self.rel_rem[1] += dy * LIBINPUT_UNITS_PER_INCH_MM * self.move_gain
+        ix, iy = int(self.rel_rem[0]), int(self.rel_rem[1])
+        if ix or iy:
+            self.rel_rem[0] -= ix
+            self.rel_rem[1] -= iy
+            out = []
+            if ix:
+                out.append((ec.EV_REL, ec.REL_X, ix))
+            if iy:
+                out.append((ec.EV_REL, ec.REL_Y, iy))
+            self.emit_rel(out)
+
+    def _move_end(self):
+        self.emit_rel([(ec.EV_KEY, self.move_btn, 0)])
+        time.sleep(0.02)
+        self.emit_kbd([(ec.EV_KEY, self.move_key, 0)])
+        log.info("trackpad window move/resize end")
+
+    def tick(self):
+        if self.mode == GESTURE and self.sub == "pending":
+            self._check_hold(self.cfg["gestures"])
+
+
 # --------------------------------------------------------------------------
 # device layer
 
@@ -1224,6 +1451,37 @@ def is_touchscreen(dev):
         return False
     abs_codes = {c for c, _ in caps.get(ec.EV_ABS, [])}
     return ec.ABS_MT_SLOT in abs_codes and ec.ABS_MT_POSITION_X in abs_codes
+
+
+def is_touchpad(dev):
+    try:
+        props = dev.input_props()
+        caps = dev.capabilities()
+    except OSError:
+        return False
+    if ec.INPUT_PROP_POINTER not in props:
+        return False
+    abs_codes = {c for c, _ in caps.get(ec.EV_ABS, [])}
+    return ec.ABS_MT_SLOT in abs_codes and ec.ABS_MT_POSITION_X in abs_codes
+
+
+def find_trackpad(cfg):
+    want = cfg.get("trackpad", {}).get("name", "")
+    for path in sorted(evdev.list_devices()):
+        try:
+            dev = InputDevice(path)
+        except OSError:
+            continue
+        if VIRTUAL_NAME_SUFFIX in dev.name:
+            dev.close()
+            continue
+        if want:
+            if want in dev.name:
+                return dev
+        elif is_touchpad(dev):
+            return dev
+        dev.close()
+    return None
 
 
 def find_device(cfg):
@@ -1429,29 +1687,112 @@ class ActionRunner:
             log.error("failed to run action %r: %s", action, exc)
 
 
-def run_device(dev, cfg, dry_run):
-    log.info("using %s (%s)", dev.name, dev.path)
+def create_shared(cfg, dry_run):
+    """Virtual devices shared by all gesture engines: an absolute pointer
+    (touchscreen holds), a relative mouse (trackpad holds and the
+    focus-under-cursor click), and a modifier keyboard."""
+    shared = {"virtuals": [], "emit_ptr": None, "emit_kbd": None,
+              "emit_rel": None, "trackpad_pinch": None,
+              "focus_under_cursor": None}
+    if dry_run or float(cfg["gestures"].get("hold_ms", 0) or 0) <= 0:
+        return shared
+
+    ptr = UInput(
+        {
+            ec.EV_ABS: [
+                (ec.ABS_X, AbsInfo(0, 0, PTR_RANGE, 0, 0, 0)),
+                (ec.ABS_Y, AbsInfo(0, 0, PTR_RANGE, 0, 0, 0)),
+            ],
+            ec.EV_KEY: [ec.BTN_LEFT, ec.BTN_RIGHT, ec.BTN_MIDDLE],
+            ec.EV_REL: [ec.REL_WHEEL],
+        },
+        name=f"{VIRTUAL_NAME_SUFFIX} pointer",
+    )
+    kbd = UInput(
+        {ec.EV_KEY: list(MODIFIER_KEYS.values())},
+        name=f"{VIRTUAL_NAME_SUFFIX} keyboard",
+    )
+    rel = UInput(
+        {
+            ec.EV_REL: [ec.REL_X, ec.REL_Y],
+            ec.EV_KEY: [ec.BTN_LEFT, ec.BTN_RIGHT],
+        },
+        name=f"{VIRTUAL_NAME_SUFFIX} mouse",
+    )
+    shared["virtuals"] = [ptr, kbd, rel]
+    log.info("virtual pointer, mouse, and modifier keyboard created")
+
+    def make_emit(device):
+        def emit(events):
+            for etype, code, value in events:
+                device.write(etype, code, value)
+            device.syn()
+        return emit
+
+    emit_ptr = make_emit(ptr)
+    emit_kbd = make_emit(kbd)
+    emit_rel = make_emit(rel)
+    shared["emit_ptr"] = emit_ptr
+    shared["emit_kbd"] = emit_kbd
+    shared["emit_rel"] = emit_rel
+
+    move_key = MODIFIER_KEYS.get(
+        str(cfg["gestures"].get("move_modifier", "Super")).lower(),
+        ec.KEY_LEFTMETA)
+
+    def focus_under_cursor():
+        """Focus the window under the pointer: a Mod+click is consumed by
+        the compositor (zero-length move grab) and activates the window
+        under the cursor, while apps never see the click."""
+        emit_kbd([(ec.EV_KEY, move_key, 1)])
+        time.sleep(0.04)
+        emit_rel([(ec.EV_KEY, ec.BTN_LEFT, 1)])
+        time.sleep(0.03)
+        emit_rel([(ec.EV_KEY, ec.BTN_LEFT, 0)])
+        time.sleep(0.02)
+        emit_kbd([(ec.EV_KEY, move_key, 0)])
+        time.sleep(0.05)
+
+    def trackpad_pinch(action, _wid):
+        if action.strip() == "close-window":
+            focus_under_cursor()
+            run_niri_action(["close-window"])
+            return
+        pinch_action(action, None)
+
+    shared["focus_under_cursor"] = focus_under_cursor
+    shared["trackpad_pinch"] = trackpad_pinch
+    return shared
+
+
+def make_clone(dev, dry_run):
+    if dry_run:
+        return None, (lambda events: None)
+    ui = UInput.from_device(
+        dev,
+        name=f"{dev.name} {VIRTUAL_NAME_SUFFIX}",
+        input_props=dev.input_props(),
+    )
+    log.info("virtual device created: %s", ui.name)
+
+    def emit(events):
+        for etype, code, value in events:
+            ui.write(etype, code, value)
+        ui.syn()
+
+    return ui, emit
+
+
+def make_touchscreen_runner(dev, cfg, dry_run, shared):
+    log.info("touchscreen: %s (%s)", dev.name, dev.path)
     mm_x = axis_resolution(dev, ec.ABS_MT_POSITION_X,
                            cfg["device"]["fallback_width_mm"])
     mm_y = axis_resolution(dev, ec.ABS_MT_POSITION_Y,
                            cfg["device"]["fallback_height_mm"])
     log.info("resolution: %.1f x %.1f units/mm", mm_x, mm_y)
 
-    ui = None
-    if not dry_run:
-        ui = UInput.from_device(
-            dev,
-            name=f"{dev.name} {VIRTUAL_NAME_SUFFIX}",
-            input_props=dev.input_props(),
-        )
-        log.info("virtual device created: %s", ui.name)
-
-    def emit(events):
-        if ui is None:
-            return
-        for etype, code, value in events:
-            ui.write(etype, code, value)
-        ui.syn()
+    ui, emit = make_clone(dev, dry_run)
+    virtuals = [v for v in (ui,) if v is not None]
 
     # In native mode, gestures are replayed on a virtual touchpad so that
     # libinput + niri handle them with the exact same continuous physics as
@@ -1495,6 +1836,7 @@ def run_device(dev, cfg, dry_run):
             caps, name=f"{VIRTUAL_NAME_SUFFIX} touchpad",
             input_props=[ec.INPUT_PROP_POINTER, ec.INPUT_PROP_BUTTONPAD],
         )
+        virtuals.append(pad)
         pad_geom = {"cx": pad_xmax // 2, "cy": pad_ymax // 2,
                     "xmax": pad_xmax, "ymax": pad_ymax}
         log.info("virtual touchpad created (%.0f x %.0f mm)",
@@ -1504,40 +1846,6 @@ def run_device(dev, cfg, dry_run):
             for etype, code, value in events:
                 pad.write(etype, code, value)
             pad.syn()
-
-    # Window gestures: a virtual absolute pointer + modifier keyboard let a
-    # 3-finger hold perform a genuine Mod+drag interactive window move.
-    ptr = None
-    kbd = None
-    emit_ptr = None
-    emit_kbd = None
-    if pad is not None and float(cfg["gestures"].get("hold_ms", 0) or 0) > 0:
-        ptr = UInput(
-            {
-                ec.EV_ABS: [
-                    (ec.ABS_X, AbsInfo(0, 0, PTR_RANGE, 0, 0, 0)),
-                    (ec.ABS_Y, AbsInfo(0, 0, PTR_RANGE, 0, 0, 0)),
-                ],
-                ec.EV_KEY: [ec.BTN_LEFT, ec.BTN_RIGHT, ec.BTN_MIDDLE],
-                ec.EV_REL: [ec.REL_WHEEL],
-            },
-            name=f"{VIRTUAL_NAME_SUFFIX} pointer",
-        )
-        kbd = UInput(
-            {ec.EV_KEY: list(MODIFIER_KEYS.values())},
-            name=f"{VIRTUAL_NAME_SUFFIX} keyboard",
-        )
-        log.info("virtual pointer and modifier keyboard created")
-
-        def emit_ptr(events):
-            for etype, code, value in events:
-                ptr.write(etype, code, value)
-            ptr.syn()
-
-        def emit_kbd(events):
-            for etype, code, value in events:
-                kbd.write(etype, code, value)
-            kbd.syn()
 
     def strip_cfg(key):
         return ((cfg.get("actions") or {}).get("strip") or {}).get(key, "")
@@ -1565,52 +1873,125 @@ def run_device(dev, cfg, dry_run):
         except OSError as exc:
             log.error("strip set %r failed: %s", cmd, exc)
 
+    has_hold = shared["emit_ptr"] is not None
     engine = GestureEngine(
         cfg, emit, ActionRunner(cfg, dry_run), mm_x, mm_y,
         TransformCache(cfg["device"]["transform"]).get,
         emit_pad=emit_pad, pad_geom=pad_geom, calib=calib,
-        emit_ptr=emit_ptr, emit_kbd=emit_kbd,
+        emit_ptr=shared["emit_ptr"], emit_kbd=shared["emit_kbd"],
         window_at=window_at if pad is not None else None,
         pinch_action=pinch_action if pad is not None else None,
-        move_edge=move_edge_action if ptr is not None else None,
+        move_edge=move_edge_action if has_hold else None,
         strip_get=strip_get if pad is not None else None,
         strip_set=strip_set if pad is not None else None,
     )
 
     dev.grab()
-    log.info("grabbed %s", dev.path)
     os.set_blocking(dev.fd, False)
-    frame = []
+    log.info("grabbed %s", dev.path)
+    return {"dev": dev, "engine": engine, "frame": [], "virtuals": virtuals}
+
+
+def make_trackpad_runner(dev, cfg, dry_run, shared):
+    log.info("trackpad: %s (%s)", dev.name, dev.path)
+    mm_x = axis_resolution(dev, ec.ABS_MT_POSITION_X, 100.0)
+    mm_y = axis_resolution(dev, ec.ABS_MT_POSITION_Y, 60.0)
+    ui, emit = make_clone(dev, dry_run)
+    xi = dev.absinfo(ec.ABS_MT_POSITION_X)
+    yi = dev.absinfo(ec.ABS_MT_POSITION_Y)
+    calib = {"u": libinput_units_per_mm("adaptive", 0.0),
+             "w_mm": (xi.max - xi.min + 1) / mm_x,
+             "h_mm": (yi.max - yi.min + 1) / mm_y}
+    engine = TrackpadEngine(
+        cfg, emit, mm_x, mm_y,
+        emit_kbd=shared["emit_kbd"], emit_rel=shared["emit_rel"],
+        pinch_action=shared["trackpad_pinch"],
+        calib=calib,
+        move_gain=float(cfg["trackpad"].get("move_gain", 1.0) or 1.0),
+    )
+    dev.grab()
+    os.set_blocking(dev.fd, False)
+    log.info("grabbed %s", dev.path)
+    return {"dev": dev, "engine": engine, "frame": [],
+            "virtuals": [v for v in (ui,) if v is not None]}
+
+
+def close_runner(runner):
+    try:
+        runner["dev"].ungrab()
+    except OSError:
+        pass
+    runner["dev"].close()
+    for v in runner["virtuals"]:
+        v.close()
+
+
+def main_loop(cfg, dry_run):
+    shared = create_shared(cfg, dry_run)
+    runners = {}
+    want_tp = bool(cfg.get("trackpad", {}).get("enabled", True))
+    missing_logged = set()
+    last_scan = 0.0
     try:
         while True:
-            ready, _, _ = select.select([dev.fd], [], [], 0.05)
-            if not ready:
-                engine.tick()
+            now = time.monotonic()
+            need_ts = "ts" not in runners
+            need_tp = want_tp and "tp" not in runners
+            if (need_ts or need_tp) and now - last_scan >= 2.0:
+                last_scan = now
+                if need_ts:
+                    dev = find_device(cfg)
+                    if dev is not None:
+                        runners["ts"] = make_touchscreen_runner(
+                            dev, cfg, dry_run, shared)
+                        missing_logged.discard("ts")
+                    elif "ts" not in missing_logged:
+                        log.info("no readable touchscreen found, waiting")
+                        missing_logged.add("ts")
+                if need_tp:
+                    dev = find_trackpad(cfg)
+                    if dev is not None:
+                        runners["tp"] = make_trackpad_runner(
+                            dev, cfg, dry_run, shared)
+                        missing_logged.discard("tp")
+                    elif "tp" not in missing_logged:
+                        log.info("no readable trackpad found, waiting "
+                                 "(udev rule needed?)")
+                        missing_logged.add("tp")
+            if not runners:
+                time.sleep(2)
                 continue
-            try:
-                events = list(dev.read())
-            except BlockingIOError:
-                continue
-            for event in events:
-                if event.type == ec.EV_SYN:
-                    if event.code == ec.SYN_REPORT:
-                        engine.process_frame(frame)
-                        frame = []
-                    elif event.code == ec.SYN_DROPPED:
-                        log.warning("SYN_DROPPED: kernel event buffer overrun")
-                        frame = []
-                else:
-                    frame.append((event.type, event.code, event.value))
-            engine.tick()
+            fd_map = {r["dev"].fd: (key, r) for key, r in runners.items()}
+            ready, _, _ = select.select(list(fd_map), [], [], 0.05)
+            for fd in ready:
+                key, runner = fd_map[fd]
+                try:
+                    events = list(runner["dev"].read())
+                except BlockingIOError:
+                    continue
+                except OSError as exc:
+                    log.warning("%s device error (%s); rescanning", key, exc)
+                    close_runner(runner)
+                    del runners[key]
+                    continue
+                for event in events:
+                    if event.type == ec.EV_SYN:
+                        if event.code == ec.SYN_REPORT:
+                            runner["engine"].process_frame(runner["frame"])
+                            runner["frame"] = []
+                        elif event.code == ec.SYN_DROPPED:
+                            log.warning("SYN_DROPPED on %s", key)
+                            runner["frame"] = []
+                    else:
+                        runner["frame"].append(
+                            (event.type, event.code, event.value))
+            for runner in runners.values():
+                runner["engine"].tick()
     finally:
-        try:
-            dev.ungrab()
-        except OSError:
-            pass
-        dev.close()
-        for virtual in (ui, pad, ptr, kbd):
-            if virtual is not None:
-                virtual.close()
+        for runner in runners.values():
+            close_runner(runner)
+        for v in shared["virtuals"]:
+            v.close()
 
 
 def main(argv=None):
@@ -1637,7 +2018,8 @@ def main(argv=None):
             except OSError as exc:
                 print(f"{path}: not readable ({exc})")
                 continue
-            kind = "touchscreen" if is_touchscreen(dev) else ""
+            kind = "touchscreen" if is_touchscreen(dev) else \
+                "touchpad" if is_touchpad(dev) else ""
             print(f"{path}  {dev.name!r}  {kind}")
             dev.close()
         return 0
@@ -1646,28 +2028,16 @@ def main(argv=None):
     if args.device:
         cfg["device"]["name"] = args.device
 
-    stop = {"flag": False}
-
     def _sig(signum, _frame):
-        stop["flag"] = True
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
 
-    while not stop["flag"]:
-        dev = find_device(cfg)
-        if dev is None:
-            log.info("no touchscreen found, retrying in 2 s")
-            time.sleep(2)
-            continue
-        try:
-            run_device(dev, cfg, args.dry_run)
-        except SystemExit:
-            break
-        except OSError as exc:
-            log.warning("device error (%s); rescanning", exc)
-            time.sleep(1)
+    try:
+        main_loop(cfg, args.dry_run)
+    except SystemExit:
+        pass
     return 0
 
 
