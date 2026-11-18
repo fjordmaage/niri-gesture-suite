@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs niri-touch-gestures for the current user.
+# Installs niri-gesture-suite for the current user.
 # The only privileged step is a udev rule that lets the logged-in seat user
 # read the touchscreen (TAG+="uaccess") — safer than joining the input group.
 set -euo pipefail
@@ -21,7 +21,7 @@ for b in blocks:
         for w in s.split():
             v = (v << 64) | int(w, 16)
         return v
-    if "niri-touch-gestures" in name.group(1):
+    if "niri-gesture-suite" in name.group(1):
         continue
     if not bits(absb.group(1)) & (1 << 0x2f):
         continue  # not multitouch
@@ -42,18 +42,18 @@ fi
 printf 'Devices: %s\n' "${TOUCH_NAMES[@]}"
 
 # --- user-level files -------------------------------------------------------
-install -Dm755 niri_touch_gestures.py "$HOME/.local/bin/niri-touch-gestures"
-if [[ ! -e "$HOME/.config/niri-touch-gestures/config.toml" ]]; then
-    install -Dm644 config.toml "$HOME/.config/niri-touch-gestures/config.toml"
-    echo "Installed default config to ~/.config/niri-touch-gestures/config.toml"
+install -Dm755 niri_gesture_suite.py "$HOME/.local/bin/niri-gesture-suite"
+if [[ ! -e "$HOME/.config/niri-gesture-suite/config.toml" ]]; then
+    install -Dm644 config.toml "$HOME/.config/niri-gesture-suite/config.toml"
+    echo "Installed default config to ~/.config/niri-gesture-suite/config.toml"
 else
-    echo "Keeping existing ~/.config/niri-touch-gestures/config.toml"
+    echo "Keeping existing ~/.config/niri-gesture-suite/config.toml"
 fi
-install -Dm644 niri-touch-gestures.service \
-    "$HOME/.config/systemd/user/niri-touch-gestures.service"
+install -Dm644 niri-gesture-suite.service \
+    "$HOME/.config/systemd/user/niri-gesture-suite.service"
 
 # --- udev rules (needs sudo once) ------------------------------------------
-RULE="/etc/udev/rules.d/70-niri-touch-gestures.rules"
+RULE="/etc/udev/rules.d/70-niri-gesture-suite.rules"
 RULE_TEXT=""
 for name in "${TOUCH_NAMES[@]}"; do
     RULE_TEXT+="SUBSYSTEM==\"input\", KERNEL==\"event*\", ATTRS{name}==\"$name\", TAG+=\"uaccess\""$'\n'
@@ -69,8 +69,8 @@ fi
 
 # --- enable -----------------------------------------------------------------
 systemctl --user daemon-reload
-systemctl --user enable --now niri-touch-gestures.service
+systemctl --user enable --now niri-gesture-suite.service
 sleep 1
-systemctl --user --no-pager --lines=5 status niri-touch-gestures.service || true
+systemctl --user --no-pager --lines=5 status niri-gesture-suite.service || true
 echo
 echo "Done. Try a 3-finger swipe on the screen."

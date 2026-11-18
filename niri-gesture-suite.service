@@ -4,7 +4,7 @@ After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
-ExecStart=%h/.local/bin/niri-touch-gestures
+ExecStart=%h/.local/bin/niri-gesture-suite
 Restart=on-failure
 RestartSec=2
 

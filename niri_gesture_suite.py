@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""niri-touch-gestures — multi-finger touchscreen gestures for the niri compositor.
+"""niri-gesture-suite — multi-finger touchscreen gestures for the niri compositor.
 
 Grabs the touchscreen (EVIOCGRAB), forwards 1-2 finger input verbatim to a
 virtual clone device (so normal touch keeps working), and interprets 3- and
@@ -34,9 +34,9 @@ except ModuleNotFoundError:  # Python < 3.11
 import evdev
 from evdev import AbsInfo, InputDevice, UInput, ecodes as ec
 
-log = logging.getLogger("niri-touch-gestures")
+log = logging.getLogger("niri-gesture-suite")
 
-VIRTUAL_NAME_SUFFIX = "niri-touch-gestures virtual"
+VIRTUAL_NAME_SUFFIX = "niri-gesture-suite virtual"
 
 DEFAULT_CONFIG = {
     "trackpad": {
@@ -2065,7 +2065,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config",
                         default=os.path.expanduser(
-                            "~/.config/niri-touch-gestures/config.toml"))
+                            "~/.config/niri-gesture-suite/config.toml"))
     parser.add_argument("--device", help="override device name match")
     parser.add_argument("--dry-run", action="store_true",
                         help="no virtual device, no actions; log only")

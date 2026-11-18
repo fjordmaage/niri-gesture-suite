@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import niri_touch_gestures as ntg
+import niri_gesture_suite as ntg
 from evdev import ecodes as ec
 
 RES = 10.0  # units per mm

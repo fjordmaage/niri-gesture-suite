@@ -1,24 +1,29 @@
-# niri-touch-gestures
+# niri-gesture-suite
 
-Multi-finger **touchscreen** gestures for the [niri](https://github.com/YaLTeR/niri)
-compositor — the same gestures you already use on the trackpad, on the glass.
+A full multi-finger gesture suite for the [niri](https://github.com/YaLTeR/niri)
+compositor, on both the **touchscreen** and the **trackpad**: native 1:1
+swipes, window move/resize by holding, pinch gestures, taps, media
+controls, and screen-edge faders.
+
+(The minimal swipe-only ancestor of this project lives on as
+`niri-touch-gestures`.)
 
 | Gesture (finger motion) | Action |
 |---|---|
 | 3-finger swipe left / right | scroll through columns |
 | 3-finger swipe up / down | switch workspaces |
 | 4-finger swipe up / down | open / close Overview |
-| 3-finger hold on a window (`window-gestures` branch) | pick up and move the window (Mod+drag); drag to top/bottom edge to carry it across workspaces |
-| 3-finger pinch in on a window (`window-gestures` branch) | close that window |
-| 3-finger spread out (`window-gestures` branch) | open a terminal |
-| 4-finger spread / pinch (`window-gestures` branch) | staged window zoom: partial column ⇄ maximized column ⇄ maximized to edges ⇄ fullscreen |
-| 4-finger hold on a window (`window-gestures` branch) | resize the window (Mod+right-drag) |
-| 3-finger double tap (`window-gestures` branch) | toggle floating |
-| 5-finger tap (`window-gestures` branch) | open the launcher |
-| 4-finger tap (`window-gestures` branch) | play / pause |
-| 4-finger swipe left / right (`window-gestures` branch) | next / previous track |
-| 5-finger pinch (`window-gestures` branch) | screenshot UI |
-| 1-finger vertical drag on the right / left screen edge (`window-gestures` branch) | volume / brightness as an absolute fader (80 mm = full range); edge taps still reach apps |
+| 3-finger hold on a window | pick up and move the window (Mod+drag); drag to top/bottom edge to carry it across workspaces |
+| 3-finger pinch in on a window | close that window |
+| 3-finger spread out | open a terminal |
+| 4-finger spread / pinch | staged window zoom: partial column ⇄ maximized column ⇄ maximized to edges ⇄ fullscreen |
+| 4-finger hold on a window | resize the window (Mod+right-drag) |
+| 3-finger double tap | toggle floating |
+| 5-finger tap | open the launcher |
+| 4-finger tap | play / pause |
+| 4-finger swipe left / right | next / previous track |
+| 5-finger pinch | screenshot UI |
+| 1-finger vertical drag on the right / left screen edge | volume / brightness as an absolute fader (80 mm = full range); edge taps still reach apps |
 
 In the default **native mode** these are niri's *own* continuous gestures:
 the view moves 1:1 with your fingers and, on release, completes or snaps back
@@ -26,8 +31,7 @@ with your release velocity — identical physics and identical physical travel
 to the trackpad. Normal 1- and 2-finger touch (taps, scrolling, pinch) keeps
 working exactly as before.
 
-On the `window-gestures` branch the extra gestures also run on the
-**trackpad**: pinches, 4/5-finger taps, 4-finger horizontal media swipes,
+The extra gestures also run on the **trackpad**: pinches, 4/5-finger taps, 4-finger horizontal media swipes,
 and hold-to-move/resize at the mouse cursor (pinch-close targets the window
 under the cursor via a compositor-consumed Mod+click). Native niri
 3/4-finger trackpad swipes pass through untouched: 3+ finger input is
@@ -65,8 +69,7 @@ solves for the gain that pins the content under your fingertips. The
 4-finger Overview zoom keeps trackpad-equivalent travel instead (it is not a
 drag; `scale_overview` tunes it).
 
-**Window gestures** (the `window-gestures` branch; `main` is the pinned
-swipe-only version): holding 3 fingers still for `hold_ms` performs a real
+**Window gestures**: holding 3 fingers still for `hold_ms` performs a real
 interactive move — the daemon warps a virtual absolute pointer to your
 fingers, holds a virtual Mod key, and presses the left button, so niri's own
 Mod+drag picks up the window under your fingers; it follows them (even if you
@@ -108,8 +111,8 @@ sudo pacman -S --needed python-evdev
 ./install.sh
 ```
 
-`install.sh` installs the daemon to `~/.local/bin/niri-touch-gestures`, a
-config to `~/.config/niri-touch-gestures/config.toml`, and a systemd user
+`install.sh` installs the daemon to `~/.local/bin/niri-gesture-suite`, a
+config to `~/.config/niri-gesture-suite/config.toml`, and a systemd user
 service, then (the one `sudo` step) adds a udev rule that `uaccess`-tags the
 touchscreen so the logged-in user can read it — scoped to that one device,
 instead of joining the `input` group and gaining access to every keyboard.
@@ -122,17 +125,17 @@ motion of your fingers; any `niri msg action …` is accepted, `""` disables a
 direction. After editing:
 
 ```bash
-systemctl --user restart niri-touch-gestures
+systemctl --user restart niri-gesture-suite
 ```
 
 ## Try it / debug
 
 ```bash
 # watch decisions without touching niri (run while the service is stopped):
-systemctl --user stop niri-touch-gestures
-niri-touch-gestures --dry-run -v
+systemctl --user stop niri-gesture-suite
+niri-gesture-suite --dry-run -v
 # logs:
-journalctl --user -u niri-touch-gestures -f
+journalctl --user -u niri-gesture-suite -f
 ```
 
 ## Troubleshooting
