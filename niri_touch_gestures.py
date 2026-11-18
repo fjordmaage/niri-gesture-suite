@@ -74,7 +74,14 @@ DEFAULT_CONFIG = {
         # Hold 3 fingers still for this long (ms) to pick up the window
         # under them and move it, exactly like Mod+drag with the mouse.
         # 0 disables. Native mode only.
-        "hold_ms": 350,
+        "hold_ms": 300,
+        # While moving a window, parking the drag within this many mm of the
+        # top/bottom screen edge switches to the workspace above/below
+        # (after move_edge_delay_ms, repeating every move_edge_repeat_ms).
+        # 0 disables.
+        "move_edge_mm": 12.0,
+        "move_edge_delay_ms": 250,
+        "move_edge_repeat_ms": 600,
         # Pinch 3 fingers together by this many mm (mean contact distance
         # from the centroid) to trigger the in3 pinch action (close the
         # window under them). 0 disables. Native mode only.
@@ -116,11 +123,14 @@ DEFAULT_CONFIG = {
         # Pinch gestures (native mode): in/out + finger count -> niri action.
         # The action targets the window under the fingers (close-window
         # directly by id; other actions via focus-window first).
+        # window-zoom-in / window-zoom-out are built-ins that walk the
+        # focused window through: partial column -> maximized column ->
+        # maximized to edges -> fullscreen (and back).
         "pinch": {
             "in3": "close-window",
-            "out3": "maximize-column",
-            "in4": "",
-            "out4": "maximize-window-to-edges",
+            "out3": "spawn kitty",
+            "in4": "window-zoom-out",
+            "out4": "window-zoom-in",
         },
     },
 }
@@ -209,6 +219,47 @@ def parse_niri_touchpad_accel(path=None):
         if tp_depth is not None and depth <= tp_depth:
             tp_depth = None
     return profile, speed
+
+
+def parse_niri_gaps(path=None):
+    """Best-effort read of the layout gap size from the niri config."""
+    if path is None:
+        base = os.environ.get("XDG_CONFIG_HOME",
+                              os.path.expanduser("~/.config"))
+        path = os.path.join(base, "niri", "config.kdl")
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return 16.0
+    for line in text.splitlines():
+        m = re.match(r"\s*gaps\s+([0-9.]+)", line.split("//")[0])
+        if m:
+            return float(m.group(1))
+    return 16.0
+
+
+def zoom_stage(tile_w, tile_h, out_w, out_h, gaps):
+    """Size stage of a tiled window: 0 partial column, 1 maximized column
+    (full working width minus gaps), 2 maximized to edges, 3 fullscreen."""
+    if tile_w >= out_w - 2 and tile_h >= out_h - 2:
+        return 3
+    if tile_w >= out_w - 2:
+        return 2
+    if tile_w >= out_w - 3.5 * gaps - 2:
+        return 1
+    return 0
+
+
+def zoom_action(zoom_in, stage, wid):
+    """The niri action argv that moves one stage up or down, or None."""
+    by_id = ["--id", str(wid)]
+    if zoom_in:
+        return {0: ["maximize-column"],
+                1: ["maximize-window-to-edges"] + by_id,
+                2: ["fullscreen-window"] + by_id}.get(stage)
+    return {3: ["fullscreen-window"] + by_id,
+            2: ["maximize-window-to-edges"] + by_id,
+            1: ["maximize-column"]}.get(stage)
 
 
 # --------------------------------------------------------------------------
@@ -320,7 +371,7 @@ class GestureEngine:
     def __init__(self, cfg, emit, act, mm_x, mm_y, transform_getter,
                  emit_pad=None, pad_geom=None, calib=None,
                  emit_ptr=None, emit_kbd=None,
-                 window_at=None, pinch_action=None):
+                 window_at=None, pinch_action=None, move_edge=None):
         self.cfg = cfg
         self.emit = emit
         self.act = act
@@ -340,6 +391,7 @@ class GestureEngine:
         self.emit_kbd = emit_kbd      # virtual modifier keyboard
         self.window_at = window_at    # (nx, ny) -> window id or None
         self.pinch_action = pinch_action  # (action str, window id or None)
+        self.move_edge = move_edge    # ("up"|"down") -> () while dragging
         self.move_key = MODIFIER_KEYS.get(
             str(cfg["gestures"].get("move_modifier", "Super")).lower(),
             ec.KEY_LEFTMETA)
@@ -386,6 +438,15 @@ class GestureEngine:
         self.prev_rset = frozenset()
         self.last_acc = (0.0, 0.0)
         self.ptr_pos = [0.0, 0.0]
+        # hold stillness tracking: holds fire after the fingers settle,
+        # wherever they settled, not only at the landing spot
+        self.settled = False
+        self.still_anchor = (0.0, 0.0, 0.0)  # (acc_x, acc_y, pinch_acc)
+        self.still_since = 0.0
+        # workspace-switch edge zones during a window move
+        self.zone_dir = None
+        self.zone_since = 0.0
+        self.zone_last = None
 
     def _apply(self, events):
         """Apply a frame to the shadow state of the real device."""
@@ -494,6 +555,7 @@ class GestureEngine:
         self.mode = GESTURE
         self._reset_gesture()
         self.t0 = time.monotonic()
+        self.still_since = self.t0
         self.transform_name = self.get_transform()
         self.transform = TRANSFORMS.get(self.transform_name,
                                         TRANSFORMS["normal"])
@@ -571,6 +633,24 @@ class GestureEngine:
                 self.pinch_acc += r - self.r_prev
             self.r_prev, self.prev_rset = r, rset
 
+        now = time.monotonic()
+        # Settle grace: forgive the wiggle of three fingers landing, so a
+        # hold doesn't need a perfectly clean touchdown.
+        if not self.settled and now - self.t0 >= 0.1:
+            self.settled = True
+            if math.hypot(*self.acc) < g["deadzone_mm"] and \
+                    abs(self.pinch_acc) < 4.0:
+                self.acc = [0.0, 0.0]
+                self.pinch_acc = 0.0
+                self.still_anchor = (0.0, 0.0, 0.0)
+        # Stillness anchor: a hold fires once the fingers stop moving for
+        # hold_ms, wherever they stopped.
+        ax, ay, ap = self.still_anchor
+        if math.hypot(self.acc[0] - ax, self.acc[1] - ay) > 3.0 or \
+                abs(self.pinch_acc - ap) > 3.0:
+            self.still_anchor = (self.acc[0], self.acc[1], self.pinch_acc)
+            self.still_since = now
+
         travel = math.hypot(*self.acc)
         n = len(self.down)
         pinch_in = float(g.get("pinch_close_mm", 0) or 0)
@@ -611,18 +691,20 @@ class GestureEngine:
             return
         if len(self.down) != 3:
             return
-        if (time.monotonic() - self.t0) * 1000.0 < hold_ms:
-            return
-        if math.hypot(*self.acc) >= g["deadzone_mm"] or \
-                abs(self.pinch_acc) >= 5.0:
+        if (time.monotonic() - self.still_since) * 1000.0 < hold_ms:
             return
         self._move_begin()
 
     def tick(self):
-        """Called periodically by the event loop; triggers time-based
-        gestures (hold) even when perfectly still fingers send no events."""
-        if self.mode == GESTURE and self.sub == "pending":
+        """Called periodically by the event loop; drives time-based behavior
+        (holds, edge dwell) even when perfectly still fingers send no
+        events."""
+        if self.mode != GESTURE:
+            return
+        if self.sub == "pending":
             self._check_hold(self.cfg["gestures"])
+        elif self.sub == "move":
+            self._move_edge_check()
 
     def _spread_mm(self):
         """Mean distance of the contacts from their centroid, in mm."""
@@ -694,6 +776,41 @@ class GestureEngine:
             0.0, self.ptr_pos[1] + dy / h_mm * PTR_RANGE))
         self.emit_ptr([(ec.EV_ABS, ec.ABS_X, int(round(self.ptr_pos[0]))),
                        (ec.EV_ABS, ec.ABS_Y, int(round(self.ptr_pos[1])))])
+        self._move_edge_check()
+
+    def _move_edge_check(self):
+        """While dragging a window, dwelling near the top/bottom screen edge
+        switches to the workspace above/below."""
+        g = self.cfg["gestures"]
+        zone_mm = float(g.get("move_edge_mm", 0) or 0)
+        if zone_mm <= 0 or self.move_edge is None:
+            return
+        c = self.calib
+        rotated = self.transform_name in ("90", "270",
+                                          "flipped-90", "flipped-270")
+        h_mm = c["w_mm"] if rotated else c["h_mm"]
+        frac = zone_mm / h_mm
+        ny = self.ptr_pos[1] / PTR_RANGE
+        d = "up" if ny <= frac else "down" if ny >= 1.0 - frac else None
+        now = time.monotonic()
+        if d != self.zone_dir:
+            self.zone_dir = d
+            self.zone_since = now
+            self.zone_last = None
+            return
+        if d is None:
+            return
+        delay = float(g.get("move_edge_delay_ms", 250) or 0) / 1000.0
+        repeat = float(g.get("move_edge_repeat_ms", 600) or 0) / 1000.0
+        if self.zone_last is None:
+            if now - self.zone_since >= delay:
+                self.zone_last = now
+                log.info("move edge: workspace %s", d)
+                self.move_edge(d)
+        elif now - self.zone_last >= repeat:
+            self.zone_last = now
+            log.info("move edge: workspace %s", d)
+            self.move_edge(d)
 
     def _move_end(self):
         self.emit_ptr([(ec.EV_KEY, ec.BTN_LEFT, 0)])
@@ -905,28 +1022,92 @@ def window_at(nx, ny):
         return None
 
 
-def pinch_action(action, wid):
-    """Run a niri action on the window under the fingers: close-window
-    targets it directly by id; anything else focuses it first."""
-    env = niri_env()
+NIRI_GAPS = parse_niri_gaps()
+
+
+def run_niri_action(argv):
     try:
-        if action.strip() == "close-window":
-            args = ["niri", "msg", "action", "close-window"]
+        subprocess.Popen(["niri", "msg", "action"] + argv, env=niri_env(),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        log.error("niri action %r failed: %s", argv, exc)
+
+
+def window_zoom(zoom_in):
+    """Walk the focused window one stage along: partial column <->
+    maximized column <-> maximized to edges <-> fullscreen."""
+    try:
+        wins = niri_json("windows")
+        w = next((x for x in wins if x.get("is_focused")), None)
+        if w is None:
+            return
+        outs = niri_json("outputs")
+        logical = next((o.get("logical") for o in outs.values()
+                        if o.get("logical")), None) or {}
+        out_w, out_h = logical.get("width"), logical.get("height")
+        if not out_w or not out_h:
+            return
+        tw, th = w["layout"]["tile_size"]
+        if w.get("is_floating"):
+            full = tw >= out_w - 2 and th >= out_h - 2
+            if zoom_in != full:
+                run_niri_action(["fullscreen-window", "--id", str(w["id"])])
+            return
+        stage = zoom_stage(tw, th, out_w, out_h, NIRI_GAPS)
+        argv = zoom_action(zoom_in, stage, w["id"])
+        log.info("window zoom %s: stage %d -> %s",
+                 "in" if zoom_in else "out", stage, argv)
+        if argv:
+            run_niri_action(argv)
+    except Exception as exc:  # noqa: BLE001
+        log.error("window zoom failed: %s", exc)
+
+
+def pinch_action(action, wid):
+    """Run a niri action for a pinch gesture. close-window targets the
+    window under the fingers by id; window-zoom-in/out are the staged size
+    built-ins; spawn runs directly; anything else focuses the window under
+    the fingers first."""
+    action = action.strip()
+    try:
+        if action == "window-zoom-in":
+            window_zoom(True)
+            return
+        if action == "window-zoom-out":
+            window_zoom(False)
+            return
+        words = shlex.split(action)
+        if words and words[0] == "spawn":
+            run_niri_action(["spawn", "--"] + words[1:])
+            return
+        if action == "close-window":
+            args = ["close-window"]
             if wid is not None:
                 args += ["--id", str(wid)]
-            subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+            run_niri_action(args)
             return
         if wid is not None:
             subprocess.run(
                 ["niri", "msg", "action", "focus-window", "--id", str(wid)],
-                env=env, timeout=2,
+                env=niri_env(), timeout=2,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.Popen(
-            ["niri", "msg", "action"] + shlex.split(action),
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run_niri_action(words)
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.error("pinch action %r failed: %s", action, exc)
+
+
+def move_edge_action(direction):
+    """Workspace switch while dragging a window to the top/bottom edge.
+    Skipped in the Overview, where niri's own edge switching handles it."""
+    try:
+        out = subprocess.run(["niri", "msg", "overview-state"],
+                             capture_output=True, timeout=2, env=niri_env())
+        if b"open" in out.stdout.lower():
+            return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    run_niri_action(["focus-workspace-up" if direction == "up"
+                     else "focus-workspace-down"])
 
 
 class ActionRunner:
@@ -1073,6 +1254,7 @@ def run_device(dev, cfg, dry_run):
         emit_ptr=emit_ptr, emit_kbd=emit_kbd,
         window_at=window_at if pad is not None else None,
         pinch_action=pinch_action if pad is not None else None,
+        move_edge=move_edge_action if ptr is not None else None,
     )
 
     dev.grab()

@@ -36,8 +36,15 @@ deadzone_mm = 6.0        # travel before a gesture engages (both modes)
 # Window gestures (native mode only):
 # Hold 3 fingers still on a window for this long (ms) to pick it up and
 # move it — a genuine Mod+drag: the window lifts and follows your fingers,
-# drop it anywhere (0 disables).
-hold_ms = 350
+# drop it anywhere (0 disables). The hold arms whenever the fingers settle,
+# so landing wiggle doesn't prevent the grab.
+hold_ms = 300
+# While moving a window, parking it within this many mm of the top/bottom
+# screen edge switches to the workspace above/below after
+# move_edge_delay_ms, repeating every move_edge_repeat_ms (0 disables).
+move_edge_mm = 12.0
+move_edge_delay_ms = 250
+move_edge_repeat_ms = 600
 # Pinch fingers together / apart by this many mm (mean contact distance
 # from the centroid) to fire the [actions.pinch] entries below.
 # Lower = snappier. 0 disables that direction.
@@ -75,10 +82,13 @@ left = ""
 right = ""
 
 # Pinch gestures (native mode): direction + finger count -> niri action.
-# Actions run on the window under your fingers: close-window targets it by
-# id, anything else focuses it first. "" disables.
+# "window-zoom-in"/"window-zoom-out" are built-ins that walk the focused
+# window through: partial column -> maximized column (Mod+F) -> maximized
+# to edges (Mod+M) -> fullscreen (F11), and back. "spawn ..." runs a
+# command. Other actions focus the window under your fingers first.
+# "" disables.
 [actions.pinch]
 in3 = "close-window"
-out3 = "maximize-column"            # = your Mod+F
-in4 = ""
-out4 = "maximize-window-to-edges"   # = your Mod+M
+out3 = "spawn kitty"
+in4 = "window-zoom-out"
+out4 = "window-zoom-in"

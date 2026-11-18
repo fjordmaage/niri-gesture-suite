@@ -95,6 +95,7 @@ def make_engine(clock, mode="discrete", scales=(1.0, 1.0, 1.0), calib=None):
     ptr_events = []
     kbd_events = []
     closed = []
+    edge_moves = []
     native = mode == "native"
     engine = ntg.GestureEngine(
         cfg,
@@ -110,11 +111,13 @@ def make_engine(clock, mode="discrete", scales=(1.0, 1.0, 1.0), calib=None):
         window_at=(lambda nx, ny: 42) if native else None,
         pinch_action=(lambda a, wid: closed.append((a, wid)))
                      if native else None,
+        move_edge=(lambda d: edge_moves.append(d)) if native else None,
     )
     engine._pad_events = pad_events
     engine._ptr_events = ptr_events
     engine._kbd_events = kbd_events
     engine._closed = closed
+    engine._edge_moves = edge_moves
     return engine, emitted, acts
 
 
@@ -594,10 +597,89 @@ def spread_run(fingers, action_expected):
     assert acts == []
 
 
+def pinch_run(fingers, action_expected):
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(
+        clock, mode="native",
+        calib={"u": 10.0, "w_mm": 512.0, "h_mm": 358.0})
+    dev = FakeTouch()
+    base = [(1000, 1000), (1400, 1000), (1200, 1400), (1200, 700)][:fingers]
+    cx = sum(p[0] for p in base) / fingers
+    cy = sum(p[1] for p in base) / fingers
+    for s, (x, y) in enumerate(base):
+        dev.down(s, x, y)
+    engine.process_frame(dev.frame())
+    for i in range(1, 10):
+        clock.t += 0.01
+        k = 1.0 - 0.1 * i
+        for s, (x, y) in enumerate(base):
+            dev.move(s, int(cx + (x - cx) * k), int(cy + (y - cy) * k))
+        engine.process_frame(dev.frame())
+    for s in range(fingers):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    assert engine._closed == [(action_expected, 42)], \
+        f"{fingers}-finger pinch: {engine._closed}"
+
+
 def test_spread_actions():
-    spread_run(3, "maximize-column")
-    spread_run(4, "maximize-window-to-edges")
-    print("ok  3-finger spread maximizes column, 4-finger to edges")
+    spread_run(3, "spawn kitty")
+    spread_run(4, "window-zoom-in")
+    pinch_run(4, "window-zoom-out")
+    print("ok  spread: terminal / zoom-in; 4-finger pinch: zoom-out")
+
+
+def test_zoom_staging():
+    # calibrated against the live Surface session: logical 1536x1024,
+    # gaps 14, top bar strut 34
+    assert ntg.zoom_stage(747, 962, 1536, 1024, 14) == 0
+    assert ntg.zoom_stage(1508, 962, 1536, 1024, 14) == 1
+    assert ntg.zoom_stage(1536, 990, 1536, 1024, 14) == 2
+    assert ntg.zoom_stage(1536, 1024, 1536, 1024, 14) == 3
+    assert ntg.zoom_action(True, 0, 5) == ["maximize-column"]
+    assert ntg.zoom_action(True, 1, 5) == \
+        ["maximize-window-to-edges", "--id", "5"]
+    assert ntg.zoom_action(True, 2, 5) == ["fullscreen-window", "--id", "5"]
+    assert ntg.zoom_action(True, 3, 5) is None
+    assert ntg.zoom_action(False, 3, 5) == ["fullscreen-window", "--id", "5"]
+    assert ntg.zoom_action(False, 2, 5) == \
+        ["maximize-window-to-edges", "--id", "5"]
+    assert ntg.zoom_action(False, 1, 5) == ["maximize-column"]
+    assert ntg.zoom_action(False, 0, 5) is None
+    print("ok  staged window zoom walks both directions")
+
+
+def test_move_edge_zones():
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(
+        clock, mode="native",
+        calib={"u": 10.0, "w_mm": 512.0, "h_mm": 358.0})
+    dev = FakeTouch()
+    pts = [(1000, 1800), (1200, 1800), (1400, 1600)]
+    for s, (x, y) in enumerate(pts):
+        dev.down(s, x, y)
+    engine.process_frame(dev.frame())
+    clock.t += 0.35
+    engine.tick()  # hold fires -> move begins
+    assert engine.sub == "move", f"expected move, got {engine.sub}"
+    # drag up close to the top edge (centroid y -> ~30 units = 3 mm)
+    steps = 20
+    for i in range(1, steps + 1):
+        clock.t += 0.01
+        for s, (x, y) in enumerate(pts):
+            dev.move(s, x, y - int((y - 90) * i / steps))
+        engine.process_frame(dev.frame())
+    assert engine._edge_moves == [], "no switch before the dwell delay"
+    clock.t += 0.3
+    engine.tick()
+    assert engine._edge_moves == ["up"], f"got {engine._edge_moves}"
+    clock.t += 0.65
+    engine.tick()
+    assert engine._edge_moves == ["up", "up"], "repeat while dwelling"
+    for s in range(3):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    print("ok  dragging to the top edge switches workspaces, with repeat")
 
 
 def test_niri_config_parse():
@@ -653,6 +735,8 @@ def main():
         test_hold_to_move,
         test_pinch_close,
         test_spread_actions,
+        test_zoom_staging,
+        test_move_edge_zones,
         test_niri_config_parse,
     ]
     failures = 0
