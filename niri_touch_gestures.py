@@ -481,7 +481,7 @@ def run_device(dev, cfg, dry_run):
             name=f"{dev.name} {VIRTUAL_NAME_SUFFIX}",
             input_props=dev.input_props(),
         )
-        log.info("virtual device created: %s", ui.device.path if ui.device else "?")
+        log.info("virtual device created: %s", ui.name)
 
     def emit(events):
         if ui is None:
