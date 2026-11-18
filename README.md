@@ -29,12 +29,22 @@ screen your fingers are *on* the content, so the content follows them:
 
 Rather than re-implementing niri's gesture physics, native mode feeds the
 gesture back through the same pipeline the trackpad uses: the daemon mirrors
-your 3/4 fingers onto a **virtual touchpad** (same spatial resolution as the
-screen), libinput recognizes a native multi-finger swipe, and niri drives its
-continuous gesture — 1:1 tracking while fingers are down, velocity-based
-completion on release, rubber-banding on partial swipes. Physical travel is
-mm-for-mm what the trackpad needs, and your niri `input.touchpad` settings
-(like `natural-scroll`) apply to it the same way.
+your 3/4 fingers onto a **virtual touchpad**, libinput recognizes a native
+multi-finger swipe, and niri drives its continuous gesture — tracking while
+fingers are down, velocity-based completion on release, rubber-banding on
+partial swipes. Your niri `input.touchpad` settings (like `natural-scroll`)
+apply to it the same way.
+
+The mirror's gain is **auto-calibrated for true direct manipulation**: the
+content moves exactly as far as your fingers. niri needs 300 libinput units
+for a workspace switch and 1200 for a working-area width of view scroll
+(`src/layout/monitor.rs`, `scrolling.rs`), and libinput's unaccelerated
+touchpad deltas are `mm × (1000/25.4) × slowdown`, where the slowdown depends
+on the accel profile (`0.9 × 0.2968` adaptive; `0.2968 × (1 + accel-speed)`
+flat) — the daemon reads your accel profile/speed from the niri config and
+solves for the gain that pins the content under your fingertips. The
+4-finger Overview zoom keeps trackpad-equivalent travel instead (it is not a
+drag; `scale_overview` tunes it).
 
 There is also a **discrete mode** (`mode = "discrete"`) where the daemon
 interprets swipes itself and fires configurable `niri msg action …` steps —

@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -56,9 +57,17 @@ DEFAULT_CONFIG = {
         # "discrete": interpret swipes in the daemon and fire the [actions]
         # below in steps (allows arbitrary mappings).
         "mode": "native",
-        # Multiplier on finger travel in native mode (1.0 = same physical
-        # distance as the trackpad).
-        "gesture_scale": 1.0,
+        # Native-mode gains. "auto" computes true direct manipulation: the
+        # content moves exactly as far as your fingers (derived from the
+        # screen's physical size, niri's gesture constants, and the libinput
+        # accel profile/speed read from your niri config). A number overrides
+        # the computed gain (1.0 = trackpad-equivalent finger travel).
+        "scale_x": "auto",
+        "scale_y": "auto",
+        # The 4-finger Overview gesture is a zoom, not a drag, so 1:1 does
+        # not apply; this is a plain multiplier on trackpad-equivalent
+        # travel (higher = shorter swipe opens the Overview).
+        "scale_overview": 1.0,
         # Travel before a swipe engages / its axis is decided (mm).
         "deadzone_mm": 6.0,
         # Travel for the first step of a 3-finger swipe (mm).
@@ -116,6 +125,66 @@ def load_config(path):
                 cfg = deep_merge(cfg, tomllib.load(f))
             log.info("loaded config %s", path)
     return cfg
+
+
+# --------------------------------------------------------------------------
+# gesture gain calibration
+#
+# niri (v26.04, src/layout/monitor.rs and scrolling.rs) maps unaccelerated
+# libinput swipe deltas to gesture progress with fixed constants:
+NIRI_WORKSPACE_MOVEMENT = 300.0   # delta units for one full workspace switch
+NIRI_VIEW_MOVEMENT = 1200.0       # delta units to scroll one working-area width
+# libinput (filter-touchpad*.c) normalizes touchpad deltas to units of
+# mm * (1000 dpi / 25.4), then multiplies by a slowdown factor that depends
+# on the configured accel profile:
+LIBINPUT_UNITS_PER_INCH_MM = 1000.0 / 25.4
+TP_MAGIC_SLOWDOWN = 0.2968
+TP_ADAPTIVE_BASELINE = 0.9
+
+
+def libinput_units_per_mm(profile, speed):
+    """Unaccelerated libinput delta units per mm of finger travel."""
+    if profile == "flat":
+        return LIBINPUT_UNITS_PER_INCH_MM * TP_MAGIC_SLOWDOWN * \
+            max(0.005, 1.0 + speed)
+    # adaptive (default): the constant filter ignores the speed setting
+    return LIBINPUT_UNITS_PER_INCH_MM * TP_ADAPTIVE_BASELINE * TP_MAGIC_SLOWDOWN
+
+
+def parse_niri_touchpad_accel(path=None):
+    """Best-effort read of accel-profile/accel-speed from the niri config."""
+    if path is None:
+        base = os.environ.get("XDG_CONFIG_HOME",
+                              os.path.expanduser("~/.config"))
+        path = os.path.join(base, "niri", "config.kdl")
+    profile, speed = "adaptive", 0.0
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return profile, speed
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    depth = 0
+    tp_depth = None
+    for line in text.splitlines():
+        s = line.split("//")[0].strip()
+        if s.startswith("/-"):
+            s = ""
+        if tp_depth is None and re.match(r"touchpad\s*\{", s):
+            tp_depth = depth
+        if tp_depth is not None:
+            m = re.search(r'accel-profile\s+"(\w+)"', s)
+            if m:
+                profile = m.group(1)
+            m = re.search(r"accel-speed\s+(-?[0-9.]+)", s)
+            if m:
+                try:
+                    speed = float(m.group(1))
+                except ValueError:
+                    pass
+        depth += s.count("{") - s.count("}")
+        if tp_depth is not None and depth <= tp_depth:
+            tp_depth = None
+    return profile, speed
 
 
 # --------------------------------------------------------------------------
@@ -204,7 +273,7 @@ class GestureEngine:
     """
 
     def __init__(self, cfg, emit, act, mm_x, mm_y, transform_getter,
-                 emit_pad=None, pad_geom=None):
+                 emit_pad=None, pad_geom=None, calib=None):
         self.cfg = cfg
         self.emit = emit
         self.act = act
@@ -215,6 +284,10 @@ class GestureEngine:
         self.emit_pad = emit_pad
         self.pad_geom = pad_geom  # {"cx","cy","xmax","ymax"} in pad raw units
         self.pad_tid = 0         # ever-increasing tracking id for the pad
+        # calibration for computing the "auto" gains: libinput units/mm and
+        # the screen's physical size in device orientation
+        self.calib = calib or {"u": libinput_units_per_mm("adaptive", 0.0),
+                               "w_mm": 100.0, "h_mm": 100.0}
 
         self.mode = FORWARD
         # Protocol B is stateful: receivers must cache per-slot values,
@@ -244,9 +317,12 @@ class GestureEngine:
         # native-mode mirror state
         self.engaged = False
         self.centroid0 = None    # centroid (mm) when the mirror engaged
-        self.scale = 1.0
+        self.sx = 1.0            # gain applied to mirrored x / y motion
+        self.sy = 1.0
+        self.engage_offset = (0.0, 0.0)  # replays pre-deadzone travel
         self.pad_map = {}        # real slot -> pad slot
         self.cur_tool = None     # BTN_TOOL_* currently reported on the pad
+        self.transform_name = "normal"
 
     def _apply(self, events):
         """Apply a frame to the shadow state of the real device."""
@@ -344,7 +420,8 @@ class GestureEngine:
     def _start_gesture(self, pre_active):
         self.mode = GESTURE
         self._reset_gesture()
-        self.transform = TRANSFORMS.get(self.get_transform(),
+        self.transform_name = self.get_transform()
+        self.transform = TRANSFORMS.get(self.transform_name,
                                         TRANSFORMS["normal"])
         # Lift the touches the clone currently has down, so apps see the
         # 1-2 fingers that landed first as cancelled, not as a tap.
@@ -383,23 +460,51 @@ class GestureEngine:
 
     # -- native mode: mirror onto the virtual touchpad ---------------------
 
+    def _gains(self, g):
+        """Mirror gains for this gesture: (sx, sy)."""
+        c = self.calib
+        if len(self.down) >= 4:
+            s = float(g.get("scale_overview", 1.0)) or 1.0
+            return s, s
+        # In rotated orientations, the logical width lies along the device's
+        # y axis; the gains apply in logical (post-transform) space.
+        rotated = self.transform_name in ("90", "270",
+                                          "flipped-90", "flipped-270")
+        w_mm = c["h_mm"] if rotated else c["w_mm"]
+        h_mm = c["w_mm"] if rotated else c["h_mm"]
+        sx_cfg = g.get("scale_x", "auto")
+        sy_cfg = g.get("scale_y", "auto")
+        sx = float(sx_cfg) if not isinstance(sx_cfg, str) \
+            else NIRI_VIEW_MOVEMENT / (c["u"] * w_mm)
+        sy = float(sy_cfg) if not isinstance(sy_cfg, str) \
+            else NIRI_WORKSPACE_MOVEMENT / (c["u"] * h_mm)
+        return sx, sy
+
     def _track_native(self, g):
         if not self.engaged:
             if math.hypot(*self.acc) < g["deadzone_mm"]:
                 return
             self.engaged = True
             self.centroid0 = self.prev_centroid
-            self.scale = float(g.get("gesture_scale", 1.0)) or 1.0
+            self.sx, self.sy = self._gains(g)
             self.fingers = len(self.down)
-            log.debug("native gesture engaged (%d fingers)", self.fingers)
+            log.debug("native gesture engaged (%d fingers, gain %.3f/%.3f)",
+                      self.fingers, self.sx, self.sy)
+            self._pad_sync()
+            # Replay the travel spent inside the deadzone on the next frame,
+            # so the content catches up to the finger instead of losing it.
+            self.engage_offset = (self.acc[0], self.acc[1])
+            return
         self._pad_sync()
 
     def _to_pad(self, x_raw, y_raw):
         vx = x_raw / self.mm_x - self.centroid0[0]
         vy = y_raw / self.mm_y - self.centroid0[1]
         tx, ty = self.transform(vx, vy)
-        px = int(round(self.pad_geom["cx"] + tx * self.scale * self.mm_x))
-        py = int(round(self.pad_geom["cy"] + ty * self.scale * self.mm_y))
+        tx += self.engage_offset[0]
+        ty += self.engage_offset[1]
+        px = int(round(self.pad_geom["cx"] + tx * self.sx * self.mm_x))
+        py = int(round(self.pad_geom["cy"] + ty * self.sy * self.mm_y))
         return (max(0, min(self.pad_geom["xmax"], px)),
                 max(0, min(self.pad_geom["ymax"], py)))
 
@@ -613,9 +718,20 @@ def run_device(dev, cfg, dry_run):
     pad = None
     emit_pad = None
     pad_geom = None
+    calib = None
     if cfg["gestures"].get("mode", "native") == "native" and not dry_run:
         xi = dev.absinfo(ec.ABS_MT_POSITION_X)
         yi = dev.absinfo(ec.ABS_MT_POSITION_Y)
+        w_mm = (xi.max - xi.min + 1) / mm_x
+        h_mm = (yi.max - yi.min + 1) / mm_y
+        profile, speed = parse_niri_touchpad_accel()
+        units = libinput_units_per_mm(profile, speed)
+        calib = {"u": units, "w_mm": w_mm, "h_mm": h_mm}
+        log.info("libinput touchpad accel: %s profile, speed %.2f "
+                 "-> %.2f units/mm", profile, speed, units)
+        log.info("auto 1:1 gains: x %.3f (view), y %.3f (workspace)",
+                 NIRI_VIEW_MOVEMENT / (units * w_mm),
+                 NIRI_WORKSPACE_MOVEMENT / (units * h_mm))
         pad_xmax = 2 * (xi.max - xi.min + 1) - 1
         pad_ymax = 2 * (yi.max - yi.min + 1) - 1
         res_x = max(1, int(round(mm_x)))
@@ -650,7 +766,7 @@ def run_device(dev, cfg, dry_run):
     engine = GestureEngine(
         cfg, emit, ActionRunner(cfg, dry_run), mm_x, mm_y,
         TransformCache(cfg["device"]["transform"]).get,
-        emit_pad=emit_pad, pad_geom=pad_geom,
+        emit_pad=emit_pad, pad_geom=pad_geom, calib=calib,
     )
 
     dev.grab()

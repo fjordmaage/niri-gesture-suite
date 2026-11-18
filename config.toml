@@ -18,9 +18,17 @@ transform = "auto"
 # "discrete": the daemon interprets swipes itself and fires the [actions]
 # below in steps — use this if you want custom mappings.
 mode = "native"
-# Native mode: multiplier on finger travel (1.0 = same physical distance as
-# the trackpad; try 1.5 if screen swipes should need less finger travel).
-gesture_scale = 1.0
+# Native-mode gains. "auto" gives true direct manipulation: windows and
+# workspaces move exactly as far as your fingers do on the glass. It is
+# computed from the screen's physical size, niri's gesture constants, and
+# the libinput accel profile/speed read from your niri config (re-read on
+# service restart). Set a number to override: 1.0 = trackpad-equivalent
+# finger travel (much faster than 1:1), smaller = slower.
+scale_x = "auto"
+scale_y = "auto"
+# The 4-finger Overview gesture is a zoom, not a drag, so 1:1 does not
+# apply; this multiplies trackpad-equivalent travel (bigger = shorter swipe).
+scale_overview = 1.0
 
 # All distances are physical millimeters on the glass.
 deadzone_mm = 6.0        # travel before a gesture engages (both modes)

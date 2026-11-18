@@ -82,10 +82,13 @@ class FakeTouch:
 PAD_GEOM = {"cx": 2560, "cy": 1790, "xmax": 5119, "ymax": 3579}
 
 
-def make_engine(clock, mode="discrete"):
+def make_engine(clock, mode="discrete", scales=(1.0, 1.0, 1.0), calib=None):
     import copy
     cfg = copy.deepcopy(ntg.DEFAULT_CONFIG)
     cfg["gestures"]["mode"] = mode
+    cfg["gestures"]["scale_x"] = scales[0]
+    cfg["gestures"]["scale_y"] = scales[1]
+    cfg["gestures"]["scale_overview"] = scales[2]
     emitted = []
     acts = []
     pad_events = []
@@ -98,6 +101,7 @@ def make_engine(clock, mode="discrete"):
         emit_pad=(lambda evs: pad_events.append(list(evs)))
                  if mode == "native" else None,
         pad_geom=PAD_GEOM if mode == "native" else None,
+        calib=calib,
     )
     engine._pad_events = pad_events
     return engine, emitted, acts
@@ -347,10 +351,11 @@ def test_native_mirror_lifecycle():
     assert len(down) == 3, f"3 mirrored contacts expected: {down}"
     assert keys.get(ec.BTN_TOUCH) == 1
     assert keys.get(ec.BTN_TOOL_TRIPLETAP) == 1
-    # mirrored contacts are recentered around the pad center at engage;
-    # by now we are (10 mm - engage point) past it, well under the deadzone
+    # mirrored contacts recenter at engage, then the pre-engage travel is
+    # replayed, so the pad centroid reflects the full 10 mm from the start
     cx = sum(p[0] for p in pos.values() if p[0] is not None) / 3
-    assert abs(cx - PAD_GEOM["cx"]) <= mm(4), f"centroid {cx} far from center"
+    assert abs(cx - (PAD_GEOM["cx"] + mm(10))) <= 2, \
+        f"centroid {cx} != center + 10 mm ({PAD_GEOM['cx'] + mm(10)})"
 
     # keep moving 20 mm -> pad centroid follows 1:1
     for i in range(1, 9):
@@ -426,6 +431,82 @@ def test_native_finger_count_transition():
     print("ok  native mode: 3->4 finger transition updates BTN_TOOL_*")
 
 
+def test_auto_gains():
+    """auto scales follow niri + libinput constants: 1:1 content tracking."""
+    clock = FakeClock()
+    calib = {"u": 10.0, "w_mm": 240.0, "h_mm": 120.0}
+    engine, emitted, acts = make_engine(
+        clock, mode="native", scales=("auto", "auto", 2.0), calib=calib)
+    pad = engine._pad_events
+    dev = FakeTouch()
+    # horizontal 3f: sx = 1200 / (10 * 240) = 0.5
+    for s in range(3):
+        dev.down(s, 1000 + s * 200, 1000)
+    engine.process_frame(dev.frame())
+    for i in range(1, 13):
+        clock.t += 0.01
+        for s in range(3):
+            dev.move(s, 1000 + s * 200 + int(mm(2.5)) * i, 1000)
+        engine.process_frame(dev.frame())
+    down, pos, keys = clone_state(pad)
+    cx = sum(pos[s][0] for s in down) / 3
+    # 30 mm of finger travel * 0.5 = 15 mm of pad travel (replay included)
+    assert abs(cx - (PAD_GEOM["cx"] + mm(15))) <= 3, \
+        f"pad moved {cx - PAD_GEOM['cx']}, expected {mm(15)}"
+    for s in range(3):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+
+    # vertical 4f: scale_overview = 2.0 (plain multiplier)
+    for s in range(4):
+        dev.down(s, 1000 + s * 200, 2000)
+    engine.process_frame(dev.frame())
+    for i in range(1, 9):
+        clock.t += 0.01
+        for s in range(4):
+            dev.move(s, 1000 + s * 200, 2000 - int(mm(2.5)) * i)
+        engine.process_frame(dev.frame())
+    down, pos, keys = clone_state(pad)
+    cy = sum(pos[s][1] for s in down) / 4
+    assert abs(cy - (PAD_GEOM["cy"] - mm(40))) <= 3, \
+        f"pad moved {cy - PAD_GEOM['cy']}, expected {-mm(40)}"
+    print("ok  auto gains: 1:1 view scale and overview multiplier")
+
+
+def test_niri_config_parse():
+    import tempfile
+    sample = """
+input {
+    touchpad {
+        natural-scroll
+        accel-speed 0.2
+        // accel-profile "adaptive"
+        accel-profile "flat"
+    }
+    mouse {
+        accel-profile "adaptive"
+        accel-speed -0.5
+    }
+}
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".kdl", delete=False) as f:
+        f.write(sample)
+        path = f.name
+    try:
+        profile, speed = ntg.parse_niri_touchpad_accel(path)
+    finally:
+        import os
+        os.unlink(path)
+    assert profile == "flat", f"profile {profile}"
+    assert abs(speed - 0.2) < 1e-9, f"speed {speed}"
+    u = ntg.libinput_units_per_mm(profile, speed)
+    assert abs(u - (1000 / 25.4) * 0.2968 * 1.2) < 1e-6, f"units {u}"
+    u = ntg.libinput_units_per_mm("adaptive", 0.7)
+    assert abs(u - (1000 / 25.4) * 0.9 * 0.2968) < 1e-6, \
+        "adaptive must ignore the speed setting"
+    print("ok  niri config parse and libinput unit math")
+
+
 def main():
     real_monotonic = time.monotonic
     clock = FakeClock()
@@ -441,6 +522,8 @@ def main():
         test_native_mirror_lifecycle,
         test_native_below_deadzone_quiet,
         test_native_finger_count_transition,
+        test_auto_gains,
+        test_niri_config_parse,
     ]
     failures = 0
     for t in tests:
