@@ -35,9 +35,9 @@ deadzone_mm = 6.0        # travel before a gesture engages (both modes)
 
 # Window gestures (native mode only):
 # Hold 3 fingers still on a window for this long (ms) to pick it up and
-# move it — a genuine Mod+drag: the window lifts and follows your fingers,
-# drop it anywhere (0 disables). The hold arms whenever the fingers settle,
-# so landing wiggle doesn't prevent the grab.
+# move it (Mod+left drag); hold 4 fingers to resize it (Mod+right drag).
+# 0 disables. The hold arms whenever the fingers settle, so landing wiggle
+# doesn't prevent the grab.
 hold_ms = 300
 # While moving a window, parking it within this many mm of the top/bottom
 # screen edge switches to the workspace above/below after
@@ -45,6 +45,21 @@ hold_ms = 300
 move_edge_mm = 12.0
 move_edge_delay_ms = 250
 move_edge_repeat_ms = 600
+
+# Multi-finger taps: all fingers down and up within tap_ms, no movement.
+# A second 3-finger tap within double_tap_ms fires three_double.
+tap_ms = 250
+double_tap_ms = 400
+
+# 1-finger edge strips: touch within strip_mm of the left/right screen edge
+# and drag vertically (strip_arm_mm to arm) to run the [actions.strip]
+# commands, one step per strip_step_mm of travel. Taps and horizontal
+# swipes in the zone reach apps unchanged (after at most strip_timeout_ms).
+# 0 disables.
+strip_mm = 4.0
+strip_arm_mm = 5.0
+strip_step_mm = 3.0
+strip_timeout_ms = 250
 # Pinch fingers together / apart by this many mm (mean contact distance
 # from the centroid) to fire the [actions.pinch] entries below.
 # Lower = snappier. 0 disables that direction.
@@ -92,3 +107,17 @@ in3 = "close-window"
 out3 = "spawn kitty"
 in4 = "window-zoom-out"
 out4 = "window-zoom-in"
+in5 = "screenshot"
+out5 = ""
+
+# Taps -> niri actions ("" disables).
+[actions.tap]
+five = "spawn vicinae toggle"
+three_double = "toggle-window-floating"
+
+# Edge strips -> shell commands (not niri actions), run once per step.
+[actions.strip]
+right_up = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%+"
+right_down = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-"
+left_up = "brightnessctl set 3%+"
+left_down = "brightnessctl set 3%-"

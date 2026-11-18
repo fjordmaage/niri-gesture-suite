@@ -12,6 +12,11 @@ compositor — the same gestures you already use on the trackpad, on the glass.
 | 3-finger pinch in on a window (`window-gestures` branch) | close that window |
 | 3-finger spread out (`window-gestures` branch) | open a terminal |
 | 4-finger spread / pinch (`window-gestures` branch) | staged window zoom: partial column ⇄ maximized column ⇄ maximized to edges ⇄ fullscreen |
+| 4-finger hold on a window (`window-gestures` branch) | resize the window (Mod+right-drag) |
+| 3-finger double tap (`window-gestures` branch) | toggle floating |
+| 5-finger tap (`window-gestures` branch) | open the launcher |
+| 5-finger pinch (`window-gestures` branch) | screenshot UI |
+| 1-finger vertical drag on the right / left screen edge (`window-gestures` branch) | volume / brightness, one step per 3 mm; edge taps still reach apps |
 
 In the default **native mode** these are niri's *own* continuous gestures:
 the view moves 1:1 with your fingers and, on release, completes or snaps back

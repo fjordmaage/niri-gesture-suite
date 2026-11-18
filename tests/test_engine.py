@@ -96,6 +96,7 @@ def make_engine(clock, mode="discrete", scales=(1.0, 1.0, 1.0), calib=None):
     kbd_events = []
     closed = []
     edge_moves = []
+    strips = []
     native = mode == "native"
     engine = ntg.GestureEngine(
         cfg,
@@ -112,12 +113,14 @@ def make_engine(clock, mode="discrete", scales=(1.0, 1.0, 1.0), calib=None):
         pinch_action=(lambda a, wid: closed.append((a, wid)))
                      if native else None,
         move_edge=(lambda d: edge_moves.append(d)) if native else None,
+        strip_run=(lambda s, d: strips.append((s, d))) if native else None,
     )
     engine._pad_events = pad_events
     engine._ptr_events = ptr_events
     engine._kbd_events = kbd_events
     engine._closed = closed
     engine._edge_moves = edge_moves
+    engine._strips = strips
     return engine, emitted, acts
 
 
@@ -682,6 +685,125 @@ def test_move_edge_zones():
     print("ok  dragging to the top edge switches workspaces, with repeat")
 
 
+CAL = {"u": 10.0, "w_mm": 512.0, "h_mm": 358.0}
+
+
+def test_hold4_resize():
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(clock, mode="native", calib=CAL)
+    dev = FakeTouch()
+    for s, (x, y) in enumerate([(1000, 900), (1200, 900),
+                                (1400, 1100), (1200, 700)]):
+        dev.down(s, x, y)
+    engine.process_frame(dev.frame())
+    clock.t += 0.35
+    engine.tick()
+    ptr = flat_events(engine._ptr_events)
+    kbd = flat_events(engine._kbd_events)
+    assert (ec.EV_KEY, ec.BTN_RIGHT, 1) in ptr, f"right button down: {ptr}"
+    assert (ec.EV_KEY, ec.BTN_LEFT, 1) not in ptr, "not a move"
+    assert (ec.EV_KEY, ntg.ec.KEY_LEFTMETA, 1) in kbd
+    for s in range(4):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    ptr = flat_events(engine._ptr_events)
+    assert (ec.EV_KEY, ec.BTN_RIGHT, 0) in ptr, "right button must release"
+    print("ok  4-finger hold starts Mod+right-drag resize")
+
+
+def test_five_tap():
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(clock, mode="native", calib=CAL)
+    dev = FakeTouch()
+    pts = [(1000, 900), (1200, 900), (1400, 1100), (1200, 700), (1600, 900)]
+    for s, (x, y) in enumerate(pts):
+        dev.down(s, x, y)
+    engine.process_frame(dev.frame())
+    clock.t += 0.12
+    for s in range(5):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    assert engine._closed == [("spawn vicinae toggle", None)], \
+        f"five tap: {engine._closed}"
+    print("ok  5-finger tap opens the launcher")
+
+
+def test_three_double_tap():
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(clock, mode="native", calib=CAL)
+    dev = FakeTouch()
+    pts = [(1000, 900), (1200, 900), (1400, 1100)]
+
+    def tap():
+        for s, (x, y) in enumerate(pts):
+            dev.down(s, x, y)
+        engine.process_frame(dev.frame())
+        clock.t += 0.1
+        for s in range(3):
+            dev.up(s)
+        engine.process_frame(dev.frame())
+
+    tap()
+    assert engine._closed == [], "single tap must do nothing"
+    clock.t += 0.2
+    tap()
+    assert engine._closed == [("toggle-window-floating", 42)], \
+        f"double tap: {engine._closed}"
+    print("ok  3-finger double tap toggles floating")
+
+
+def test_five_pinch_screenshot():
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(clock, mode="native", calib=CAL)
+    dev = FakeTouch()
+    base = [(1000, 900), (1400, 900), (1200, 1400), (1000, 1400), (1400, 600)]
+    cx = sum(p[0] for p in base) / 5
+    cy = sum(p[1] for p in base) / 5
+    for s, (x, y) in enumerate(base):
+        dev.down(s, x, y)
+    engine.process_frame(dev.frame())
+    for i in range(1, 10):
+        clock.t += 0.01
+        k = 1.0 - 0.1 * i
+        for s, (x, y) in enumerate(base):
+            dev.move(s, int(cx + (x - cx) * k), int(cy + (y - cy) * k))
+        engine.process_frame(dev.frame())
+    assert engine._closed == [("screenshot", 42)], \
+        f"5-finger pinch: {engine._closed}"
+    print("ok  5-finger pinch takes a screenshot")
+
+
+def test_strip_volume_and_replay():
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(clock, mode="native", calib=CAL)
+    dev = FakeTouch()
+    # right edge: 510 mm of 512 -> raw x 5100; drag up 14 mm
+    dev.down(0, 5100, 2000)
+    engine.process_frame(dev.frame())
+    for i in range(1, 8):
+        clock.t += 0.01
+        dev.move(0, 5100, 2000 - 20 * i)  # 2 mm per frame
+        engine.process_frame(dev.frame())
+    dev.up(0)
+    engine.process_frame(dev.frame())
+    # arming consumes the first 6 mm; the remaining 8 mm -> 2 steps of 3 mm
+    assert engine._strips == [("right", "up")] * 2, f"got {engine._strips}"
+    assert emitted == [], "strip touches must never reach apps"
+
+    # a tap on the left edge is replayed to the app untouched
+    dev2 = FakeTouch()
+    dev2.down(0, 10, 1500)
+    engine.process_frame(dev2.frame())
+    clock.t += 0.05
+    dev2.up(0)
+    engine.process_frame(dev2.frame())
+    down, pos, keys = clone_state(emitted)
+    assert pos.get(0) == [10, 1500], f"edge tap must replay: {pos}"
+    assert keys.get(ec.BTN_TOUCH) == 0
+    assert len(engine._strips) == 2, "no extra strip events"
+    print("ok  right-edge drag adjusts volume; edge taps pass through")
+
+
 def test_niri_config_parse():
     import tempfile
     sample = """
@@ -737,6 +859,11 @@ def main():
         test_spread_actions,
         test_zoom_staging,
         test_move_edge_zones,
+        test_hold4_resize,
+        test_five_tap,
+        test_three_double_tap,
+        test_five_pinch_screenshot,
+        test_strip_volume_and_replay,
         test_niri_config_parse,
     ]
     failures = 0

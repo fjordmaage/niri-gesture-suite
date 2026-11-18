@@ -82,6 +82,20 @@ DEFAULT_CONFIG = {
         "move_edge_mm": 12.0,
         "move_edge_delay_ms": 250,
         "move_edge_repeat_ms": 600,
+        # Multi-finger taps: all fingers down and up within tap_ms with no
+        # movement. A second 3-finger tap within double_tap_ms fires the
+        # three_double action.
+        "tap_ms": 250,
+        "double_tap_ms": 400,
+        # 1-finger edge strips: a touch starting within strip_mm of the
+        # left/right screen edge and dragging vertically (strip_arm_mm to
+        # arm) adjusts brightness/volume, one step per strip_step_mm.
+        # Taps and horizontal swipes in the zone are passed through to apps
+        # after at most strip_timeout_ms. 0 disables.
+        "strip_mm": 4.0,
+        "strip_arm_mm": 5.0,
+        "strip_step_mm": 3.0,
+        "strip_timeout_ms": 250,
         # Pinch 3 fingers together by this many mm (mean contact distance
         # from the centroid) to trigger the in3 pinch action (close the
         # window under them). 0 disables. Native mode only.
@@ -131,6 +145,20 @@ DEFAULT_CONFIG = {
             "out3": "spawn kitty",
             "in4": "window-zoom-out",
             "out4": "window-zoom-in",
+            "in5": "screenshot",
+            "out5": "",
+        },
+        # Taps -> niri actions ("" disables).
+        "tap": {
+            "five": "spawn vicinae toggle",
+            "three_double": "toggle-window-floating",
+        },
+        # Edge strips -> commands (not niri actions), run once per step.
+        "strip": {
+            "right_up": "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%+",
+            "right_down": "wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-",
+            "left_up": "brightnessctl set 3%+",
+            "left_down": "brightnessctl set 3%-",
         },
     },
 }
@@ -358,6 +386,7 @@ def niri_env():
 # gesture engine (pure logic; testable without devices)
 
 FORWARD, GESTURE, DRAIN = "forward", "gesture", "drain"
+STRIP_PENDING, STRIP = "strip_pending", "strip"
 
 
 class GestureEngine:
@@ -371,7 +400,8 @@ class GestureEngine:
     def __init__(self, cfg, emit, act, mm_x, mm_y, transform_getter,
                  emit_pad=None, pad_geom=None, calib=None,
                  emit_ptr=None, emit_kbd=None,
-                 window_at=None, pinch_action=None, move_edge=None):
+                 window_at=None, pinch_action=None, move_edge=None,
+                 strip_run=None):
         self.cfg = cfg
         self.emit = emit
         self.act = act
@@ -392,6 +422,14 @@ class GestureEngine:
         self.window_at = window_at    # (nx, ny) -> window id or None
         self.pinch_action = pinch_action  # (action str, window id or None)
         self.move_edge = move_edge    # ("up"|"down") -> () while dragging
+        self.strip_run = strip_run    # ("left"|"right", "up"|"down") -> ()
+        self.last_tap3 = 0.0          # time of the last 3-finger tap
+        # edge-strip state
+        self.strip_side = None
+        self.strip_buf = []
+        self.strip_t0 = 0.0
+        self.strip_start = None       # (x_mm, y_mm) logical at touchdown
+        self.strip_ref = 0.0          # y_mm reference for step firing
         self.move_key = MODIFIER_KEYS.get(
             str(cfg["gestures"].get("move_modifier", "Super")).lower(),
             ec.KEY_LEFTMETA)
@@ -438,6 +476,9 @@ class GestureEngine:
         self.prev_rset = frozenset()
         self.last_acc = (0.0, 0.0)
         self.ptr_pos = [0.0, 0.0]
+        self.max_count = 0       # most fingers seen during this gesture
+        self.last_norm = None    # last centroid in normalized logical coords
+        self.move_btn = ec.BTN_LEFT
         # hold stillness tracking: holds fire after the fingers settle,
         # wherever they settled, not only at the landing spot
         self.settled = False
@@ -517,9 +558,16 @@ class GestureEngine:
         if self.mode == FORWARD:
             if count >= 3:
                 self._start_gesture(pre_active)
+            elif count == 1 and not pre_active and self._strip_enter():
+                self.strip_buf = [list(events)]
             else:
                 self._forward(events)
+        elif self.mode == STRIP_PENDING:
+            self._strip_pending(events, count)
+        elif self.mode == STRIP:
+            self._strip_track(count)
         elif self.mode == GESTURE:
+            self.max_count = max(self.max_count, count)
             if self.sub == "move":
                 # a window drag keeps following even if fingers lift down
                 # to one; it ends when the last finger leaves the glass
@@ -556,6 +604,7 @@ class GestureEngine:
         self._reset_gesture()
         self.t0 = time.monotonic()
         self.still_since = self.t0
+        self.max_count = len(self.down)
         self.transform_name = self.get_transform()
         self.transform = TRANSFORMS.get(self.transform_name,
                                         TRANSFORMS["normal"])
@@ -653,10 +702,11 @@ class GestureEngine:
 
         travel = math.hypot(*self.acc)
         n = len(self.down)
+        self.last_norm = self._centroid_norm_logical() or self.last_norm
         pinch_in = float(g.get("pinch_close_mm", 0) or 0)
         pinch_out = float(g.get("pinch_out_mm", 0) or 0)
 
-        if n in (3, 4):
+        if n in (3, 4, 5):
             # A pinch only needs to outrun 60% of the centroid travel, so
             # asymmetric pinches (anchored thumb) still fire promptly.
             if pinch_in > 0 and self.pinch_acc <= -pinch_in \
@@ -689,22 +739,138 @@ class GestureEngine:
         hold_ms = float(g.get("hold_ms", 0) or 0)
         if hold_ms <= 0 or self.emit_ptr is None or self.emit_kbd is None:
             return
-        if len(self.down) != 3:
+        n = len(self.down)
+        if n not in (3, 4):
             return
         if (time.monotonic() - self.still_since) * 1000.0 < hold_ms:
             return
-        self._move_begin()
+        # 3-finger hold moves the window (Mod+left drag); 4-finger hold
+        # resizes it (Mod+right drag).
+        self._move_begin(ec.BTN_LEFT if n == 3 else ec.BTN_RIGHT)
 
     def tick(self):
         """Called periodically by the event loop; drives time-based behavior
         (holds, edge dwell) even when perfectly still fingers send no
         events."""
+        if self.mode == STRIP_PENDING:
+            timeout = float(self.cfg["gestures"].get(
+                "strip_timeout_ms", 250) or 250) / 1000.0
+            if time.monotonic() - self.strip_t0 >= timeout:
+                self._strip_exit(replay=True)  # long press: give it to the app
+            return
         if self.mode != GESTURE:
             return
         if self.sub == "pending":
             self._check_hold(self.cfg["gestures"])
         elif self.sub == "move":
             self._move_edge_check()
+
+    # -- 1-finger edge strips (brightness / volume) ------------------------
+
+    def _logical_size_mm(self):
+        c = self.calib
+        rotated = self.transform_name in ("90", "270",
+                                          "flipped-90", "flipped-270")
+        if rotated:
+            return c["h_mm"], c["w_mm"]
+        return c["w_mm"], c["h_mm"]
+
+    def _contact_mm(self):
+        """The single contact as logical-mm coordinates, or None."""
+        norm = self._centroid_norm_logical()
+        if norm is None:
+            return None
+        w_mm, h_mm = self._logical_size_mm()
+        return norm[0] * w_mm, norm[1] * h_mm
+
+    def _strip_enter(self):
+        """If the new single touch starts in an edge strip, capture it."""
+        g = self.cfg["gestures"]
+        zone = float(g.get("strip_mm", 0) or 0)
+        if zone <= 0 or self.strip_run is None:
+            return False
+        self.transform_name = self.get_transform()
+        self.transform = TRANSFORMS.get(self.transform_name,
+                                        TRANSFORMS["normal"])
+        pos = self._contact_mm()
+        if pos is None:
+            return False
+        w_mm, _ = self._logical_size_mm()
+        if pos[0] <= zone:
+            self.strip_side = "left"
+        elif pos[0] >= w_mm - zone:
+            self.strip_side = "right"
+        else:
+            return False
+        self.mode = STRIP_PENDING
+        self.strip_t0 = time.monotonic()
+        self.strip_start = pos
+        return True
+
+    def _strip_replay(self):
+        """Forward the buffered frames: the touch was meant for an app."""
+        for frame in self.strip_buf:
+            evs = [(t, c, v) for t, c, v in frame if t != ec.EV_SYN]
+            if evs:
+                self._emit(evs)
+        self.strip_buf = []
+
+    def _strip_exit(self, replay):
+        if replay:
+            self._strip_replay()
+        else:
+            self.strip_buf = []
+            self.resync = True
+        self.strip_side = None
+        self.mode = FORWARD
+
+    def _strip_pending(self, events, count):
+        g = self.cfg["gestures"]
+        self.strip_buf.append(list(events))
+        if count == 0:
+            self._strip_exit(replay=True)  # it was a tap: let the app see it
+            return
+        if count >= 2:
+            self._strip_exit(replay=True)
+            if count >= 3:
+                self._start_gesture(set(self.down))
+            return
+        pos = self._contact_mm()
+        if pos is None:
+            return
+        dx = pos[0] - self.strip_start[0]
+        dy = pos[1] - self.strip_start[1]
+        arm = float(g.get("strip_arm_mm", 5.0) or 5.0)
+        if abs(dy) >= arm and abs(dy) > 2.0 * abs(dx):
+            self.strip_buf = []
+            self.strip_ref = pos[1]
+            self.mode = STRIP
+            log.info("edge strip armed: %s", self.strip_side)
+        elif abs(dx) >= arm:
+            self._strip_exit(replay=True)  # horizontal: not a strip
+
+    def _strip_track(self, count):
+        if count == 0:
+            self.strip_side = None
+            self.mode = FORWARD
+            self.resync = True
+            return
+        if count >= 2:
+            self.strip_side = None
+            self.mode = DRAIN
+            return
+        pos = self._contact_mm()
+        if pos is None:
+            return
+        g = self.cfg["gestures"]
+        step = float(g.get("strip_step_mm", 3.0) or 3.0)
+        d = self.strip_ref - pos[1]  # moving up is positive
+        n = int(d / step)
+        if n:
+            self.strip_ref -= n * step
+            direction = "up" if n > 0 else "down"
+            for _ in range(min(abs(n), 10)):
+                self.strip_run(self.strip_side, direction)
 
     def _spread_mm(self):
         """Mean distance of the contacts from their centroid, in mm."""
@@ -745,19 +911,21 @@ class GestureEngine:
 
     # -- hold to move (virtual Mod+drag) -----------------------------------
 
-    def _move_begin(self):
+    def _move_begin(self, button=ec.BTN_LEFT):
         pos = self._centroid_norm_logical()
         if pos is None:
             return
         self.sub = "move"
+        self.move_btn = button
         self.fingers = len(self.down)
         self.ptr_pos = [pos[0] * PTR_RANGE, pos[1] * PTR_RANGE]
         self.last_acc = (self.acc[0], self.acc[1])
         self.emit_ptr([(ec.EV_ABS, ec.ABS_X, int(round(self.ptr_pos[0]))),
                        (ec.EV_ABS, ec.ABS_Y, int(round(self.ptr_pos[1])))])
         self.emit_kbd([(ec.EV_KEY, self.move_key, 1)])
-        self.emit_ptr([(ec.EV_KEY, ec.BTN_LEFT, 1)])
-        log.info("window move begin")
+        self.emit_ptr([(ec.EV_KEY, button, 1)])
+        log.info("window %s begin",
+                 "move" if button == ec.BTN_LEFT else "resize")
 
     def _move_update(self):
         c = self.calib
@@ -813,9 +981,9 @@ class GestureEngine:
             self.move_edge(d)
 
     def _move_end(self):
-        self.emit_ptr([(ec.EV_KEY, ec.BTN_LEFT, 0)])
+        self.emit_ptr([(ec.EV_KEY, self.move_btn, 0)])
         self.emit_kbd([(ec.EV_KEY, self.move_key, 0)])
-        log.info("window move end")
+        log.info("window move/resize end")
 
     def _to_pad(self, x_raw, y_raw):
         vx = x_raw / self.mm_x - self.centroid0[0]
@@ -920,10 +1088,44 @@ class GestureEngine:
             return "right" if sign > 0 else "left"
         return "down" if sign > 0 else "up"
 
+    def _check_taps(self, g):
+        """Multi-finger taps, decided when the gesture ends unclaimed."""
+        if self.pinch_action is None or \
+                g.get("mode", "native") != "native":
+            return
+        now = time.monotonic()
+        if (now - self.t0) * 1000.0 > float(g.get("tap_ms", 250) or 250):
+            return
+        if math.hypot(*self.acc) >= g["deadzone_mm"] or \
+                abs(self.pinch_acc) >= 5.0:
+            return
+        taps = (self.cfg.get("actions") or {}).get("tap") or {}
+        if self.max_count >= 5:
+            action = taps.get("five", "")
+            if action:
+                log.info("5-finger tap -> %s", action)
+                self.pinch_action(action, None)
+        elif self.max_count == 3:
+            if (now - self.last_tap3) * 1000.0 <= \
+                    float(g.get("double_tap_ms", 400) or 400):
+                self.last_tap3 = 0.0
+                action = taps.get("three_double", "")
+                if action:
+                    wid = self.window_at(*self.last_norm) \
+                        if (self.window_at and self.last_norm) else None
+                    log.info("3-finger double tap -> %s (window %s)",
+                             action, wid)
+                    self.pinch_action(action, wid)
+            else:
+                self.last_tap3 = now
+
     def _finalize(self):
         g = self.cfg["gestures"]
         if self.engaged:
             self._release_pad()
+        elif g.get("mode", "native") == "native" and self.emit_pad is not None:
+            if self.sub == "pending":
+                self._check_taps(g)
         elif self.axis is not None and not self.fired and len(self.samples) >= 2:
             a_now = self.acc[0] if self.axis == "h" else self.acc[1]
             t0, x0, y0 = self.samples[0]
@@ -1079,6 +1281,10 @@ def pinch_action(action, wid):
         words = shlex.split(action)
         if words and words[0] == "spawn":
             run_niri_action(["spawn", "--"] + words[1:])
+            return
+        if words and words[0] in ("screenshot", "screenshot-screen",
+                                  "screenshot-window"):
+            run_niri_action(words)  # no window focusing needed
             return
         if action == "close-window":
             args = ["close-window"]
@@ -1247,6 +1453,17 @@ def run_device(dev, cfg, dry_run):
                 kbd.write(etype, code, value)
             kbd.syn()
 
+    def strip_run(side, direction):
+        cmd = ((cfg.get("actions") or {}).get("strip") or {}).get(
+            f"{side}_{direction}", "")
+        if not cmd:
+            return
+        try:
+            subprocess.Popen(shlex.split(cmd), stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            log.error("strip command %r failed: %s", cmd, exc)
+
     engine = GestureEngine(
         cfg, emit, ActionRunner(cfg, dry_run), mm_x, mm_y,
         TransformCache(cfg["device"]["transform"]).get,
@@ -1255,6 +1472,7 @@ def run_device(dev, cfg, dry_run):
         window_at=window_at if pad is not None else None,
         pinch_action=pinch_action if pad is not None else None,
         move_edge=move_edge_action if ptr is not None else None,
+        strip_run=strip_run if pad is not None else None,
     )
 
     dev.grab()
