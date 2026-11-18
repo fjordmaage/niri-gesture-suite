@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import re
+import select
 import shlex
 import signal
 import subprocess
@@ -70,6 +71,16 @@ DEFAULT_CONFIG = {
         "scale_overview": 1.0,
         # Travel before a swipe engages / its axis is decided (mm).
         "deadzone_mm": 6.0,
+        # Hold 3 fingers still for this long (ms) to pick up the window
+        # under them and move it, exactly like Mod+drag with the mouse.
+        # 0 disables. Native mode only.
+        "hold_ms": 350,
+        # Pinch 3 fingers together by this many mm to close the window
+        # under them. 0 disables. Native mode only.
+        "pinch_close_mm": 20.0,
+        # Modifier used for the window-move drag; must match your niri Mod.
+        # One of "Super", "Alt", "Ctrl", "Shift".
+        "move_modifier": "Super",
         # Travel for the first step of a 3-finger swipe (mm).
         "trigger_mm": 28.0,
         # Travel for each subsequent step in the same swipe (mm).
@@ -201,6 +212,27 @@ TRANSFORMS = {
     "flipped-270": lambda dx, dy: (-dy, -dx),
 }
 
+# Same transforms for absolute normalized coordinates in [0, 1].
+ABS_TRANSFORMS = {
+    "normal": lambda nx, ny: (nx, ny),
+    "90": lambda nx, ny: (ny, 1 - nx),
+    "180": lambda nx, ny: (1 - nx, 1 - ny),
+    "270": lambda nx, ny: (1 - ny, nx),
+    "flipped": lambda nx, ny: (1 - nx, ny),
+    "flipped-90": lambda nx, ny: (ny, nx),
+    "flipped-180": lambda nx, ny: (nx, 1 - ny),
+    "flipped-270": lambda nx, ny: (1 - ny, 1 - nx),
+}
+
+MODIFIER_KEYS = {
+    "super": ec.KEY_LEFTMETA,
+    "alt": ec.KEY_LEFTALT,
+    "ctrl": ec.KEY_LEFTCTRL,
+    "shift": ec.KEY_LEFTSHIFT,
+}
+
+PTR_RANGE = 65535  # virtual absolute pointer axis range
+
 
 def niri_transform_name(raw):
     """Map niri's JSON transform naming to our keys."""
@@ -273,7 +305,9 @@ class GestureEngine:
     """
 
     def __init__(self, cfg, emit, act, mm_x, mm_y, transform_getter,
-                 emit_pad=None, pad_geom=None, calib=None):
+                 emit_pad=None, pad_geom=None, calib=None,
+                 emit_ptr=None, emit_kbd=None,
+                 window_at=None, close_window=None):
         self.cfg = cfg
         self.emit = emit
         self.act = act
@@ -288,6 +322,14 @@ class GestureEngine:
         # the screen's physical size in device orientation
         self.calib = calib or {"u": libinput_units_per_mm("adaptive", 0.0),
                                "w_mm": 100.0, "h_mm": 100.0}
+        # window gestures (hold to move, pinch to close)
+        self.emit_ptr = emit_ptr      # virtual absolute pointer
+        self.emit_kbd = emit_kbd      # virtual modifier keyboard
+        self.window_at = window_at    # (nx, ny) -> window id or None
+        self.close_window = close_window  # (window id or None) -> ()
+        self.move_key = MODIFIER_KEYS.get(
+            str(cfg["gestures"].get("move_modifier", "Super")).lower(),
+            ec.KEY_LEFTMETA)
 
         self.mode = FORWARD
         # Protocol B is stateful: receivers must cache per-slot values,
@@ -323,6 +365,14 @@ class GestureEngine:
         self.pad_map = {}        # real slot -> pad slot
         self.cur_tool = None     # BTN_TOOL_* currently reported on the pad
         self.transform_name = "normal"
+        # pending-gesture disambiguation (native mode)
+        self.sub = "pending"     # pending | swipe | move | done
+        self.t0 = 0.0            # when the gesture started
+        self.pinch_acc = 0.0     # accumulated spread change, mm (neg = pinch)
+        self.r_prev = None
+        self.prev_rset = frozenset()
+        self.last_acc = (0.0, 0.0)
+        self.ptr_pos = [0.0, 0.0]
 
     def _apply(self, events):
         """Apply a frame to the shadow state of the real device."""
@@ -396,7 +446,17 @@ class GestureEngine:
             else:
                 self._forward(events)
         elif self.mode == GESTURE:
-            if count >= 3:
+            if self.sub == "move":
+                # a window drag keeps following even if fingers lift down
+                # to one; it ends when the last finger leaves the glass
+                if count == 0:
+                    self._move_end()
+                    self._reset_gesture()
+                    self.mode = FORWARD
+                    self.resync = True
+                else:
+                    self._track()
+            elif count >= 3:
                 self._track()
             else:
                 self._finalize()
@@ -420,6 +480,7 @@ class GestureEngine:
     def _start_gesture(self, pre_active):
         self.mode = GESTURE
         self._reset_gesture()
+        self.t0 = time.monotonic()
         self.transform_name = self.get_transform()
         self.transform = TRANSFORMS.get(self.transform_name,
                                         TRANSFORMS["normal"])
@@ -481,21 +542,139 @@ class GestureEngine:
         return sx, sy
 
     def _track_native(self, g):
-        if not self.engaged:
-            if math.hypot(*self.acc) < g["deadzone_mm"]:
-                return
-            self.engaged = True
-            self.centroid0 = self.prev_centroid
-            self.sx, self.sy = self._gains(g)
-            self.fingers = len(self.down)
-            log.debug("native gesture engaged (%d fingers, gain %.3f/%.3f)",
-                      self.fingers, self.sx, self.sy)
+        if self.sub == "swipe":
             self._pad_sync()
-            # Replay the travel spent inside the deadzone on the next frame,
-            # so the content catches up to the finger instead of losing it.
-            self.engage_offset = (self.acc[0], self.acc[1])
+        elif self.sub == "move":
+            self._move_update()
+        elif self.sub == "pending":
+            self._pending(g)
+        # "done": swallow until all fingers lift
+
+    def _pending(self, g):
+        """Disambiguate swipe vs pinch-close vs hold-to-move."""
+        r, rset = self._spread_mm()
+        if r is not None:
+            if self.r_prev is not None and rset == self.prev_rset:
+                self.pinch_acc += r - self.r_prev
+            self.r_prev, self.prev_rset = r, rset
+
+        travel = math.hypot(*self.acc)
+        n = len(self.down)
+        pinch_mm = float(g.get("pinch_close_mm", 0) or 0)
+
+        if n == 3 and pinch_mm > 0 and self.pinch_acc <= -pinch_mm \
+                and -self.pinch_acc >= travel:
+            self._pinch_close()
             return
+        if travel >= g["deadzone_mm"] and \
+                (n != 3 or travel >= 1.2 * abs(self.pinch_acc)):
+            self._engage_swipe(g)
+            return
+        self._check_hold(g)
+
+    def _engage_swipe(self, g):
+        self.sub = "swipe"
+        self.engaged = True
+        self.centroid0 = self.prev_centroid
+        self.sx, self.sy = self._gains(g)
+        self.fingers = len(self.down)
+        log.debug("native gesture engaged (%d fingers, gain %.3f/%.3f)",
+                  self.fingers, self.sx, self.sy)
         self._pad_sync()
+        # Replay the travel spent inside the deadzone on the next frame,
+        # so the content catches up to the finger instead of losing it.
+        self.engage_offset = (self.acc[0], self.acc[1])
+
+    def _check_hold(self, g):
+        hold_ms = float(g.get("hold_ms", 0) or 0)
+        if hold_ms <= 0 or self.emit_ptr is None or self.emit_kbd is None:
+            return
+        if len(self.down) != 3:
+            return
+        if (time.monotonic() - self.t0) * 1000.0 < hold_ms:
+            return
+        if math.hypot(*self.acc) >= g["deadzone_mm"] or \
+                abs(self.pinch_acc) >= 5.0:
+            return
+        self._move_begin()
+
+    def tick(self):
+        """Called periodically by the event loop; triggers time-based
+        gestures (hold) even when perfectly still fingers send no events."""
+        if self.mode == GESTURE and self.sub == "pending":
+            self._check_hold(self.cfg["gestures"])
+
+    def _spread_mm(self):
+        """Mean distance of the contacts from their centroid, in mm."""
+        act = {s: self.pos[s] for s in self.down
+               if s in self.pos and self.pos[s][0] is not None
+               and self.pos[s][1] is not None}
+        if len(act) < 2:
+            return None, frozenset()
+        cx = sum(v[0] for v in act.values()) / len(act) / self.mm_x
+        cy = sum(v[1] for v in act.values()) / len(act) / self.mm_y
+        r = sum(math.hypot(v[0] / self.mm_x - cx, v[1] / self.mm_y - cy)
+                for v in act.values()) / len(act)
+        return r, frozenset(act)
+
+    def _centroid_norm_logical(self):
+        """Centroid as normalized [0,1] logical-output coordinates."""
+        centroid, _ = self._centroid_mm()
+        if centroid is None:
+            return None
+        nx = min(1.0, max(0.0, centroid[0] / self.calib["w_mm"]))
+        ny = min(1.0, max(0.0, centroid[1] / self.calib["h_mm"]))
+        f = ABS_TRANSFORMS.get(self.transform_name, ABS_TRANSFORMS["normal"])
+        return f(nx, ny)
+
+    # -- pinch to close ----------------------------------------------------
+
+    def _pinch_close(self):
+        self.sub = "done"
+        pos = self._centroid_norm_logical()
+        wid = self.window_at(*pos) if (self.window_at and pos) else None
+        log.info("pinch close (window %s)", wid if wid else "focused")
+        if self.close_window:
+            self.close_window(wid)
+
+    # -- hold to move (virtual Mod+drag) -----------------------------------
+
+    def _move_begin(self):
+        pos = self._centroid_norm_logical()
+        if pos is None:
+            return
+        self.sub = "move"
+        self.fingers = len(self.down)
+        self.ptr_pos = [pos[0] * PTR_RANGE, pos[1] * PTR_RANGE]
+        self.last_acc = (self.acc[0], self.acc[1])
+        self.emit_ptr([(ec.EV_ABS, ec.ABS_X, int(round(self.ptr_pos[0]))),
+                       (ec.EV_ABS, ec.ABS_Y, int(round(self.ptr_pos[1])))])
+        self.emit_kbd([(ec.EV_KEY, self.move_key, 1)])
+        self.emit_ptr([(ec.EV_KEY, ec.BTN_LEFT, 1)])
+        log.info("window move begin")
+
+    def _move_update(self):
+        c = self.calib
+        rotated = self.transform_name in ("90", "270",
+                                          "flipped-90", "flipped-270")
+        w_mm = c["h_mm"] if rotated else c["w_mm"]
+        h_mm = c["w_mm"] if rotated else c["h_mm"]
+        dx = self.acc[0] - self.last_acc[0]
+        dy = self.acc[1] - self.last_acc[1]
+        if not dx and not dy:
+            return
+        self.last_acc = (self.acc[0], self.acc[1])
+        self.ptr_pos[0] = min(PTR_RANGE, max(
+            0.0, self.ptr_pos[0] + dx / w_mm * PTR_RANGE))
+        self.ptr_pos[1] = min(PTR_RANGE, max(
+            0.0, self.ptr_pos[1] + dy / h_mm * PTR_RANGE))
+        self.emit_ptr([(ec.EV_ABS, ec.ABS_X, int(round(self.ptr_pos[0]))),
+                       (ec.EV_ABS, ec.ABS_Y, int(round(self.ptr_pos[1])))])
+
+    def _move_end(self):
+        self.emit_ptr([(ec.EV_KEY, ec.BTN_LEFT, 0)])
+        self.emit_kbd([(ec.EV_KEY, self.move_key, 0)])
+        log.info("window move end")
 
     def _to_pad(self, x_raw, y_raw):
         vx = x_raw / self.mm_x - self.centroid0[0]
@@ -660,6 +839,59 @@ def axis_resolution(dev, axis, fallback_mm):
     return span / fallback_mm
 
 
+def niri_json(what):
+    out = subprocess.run(["niri", "msg", "-j", what],
+                         capture_output=True, timeout=2, env=niri_env())
+    return json.loads(out.stdout)
+
+
+def window_at(nx, ny):
+    """Find the window whose tile contains the given normalized logical
+    coordinates on the focused output. Returns its id, or None."""
+    try:
+        wss = niri_json("workspaces")
+        ws = next((w for w in wss if w.get("is_focused")), None)
+        if ws is None:
+            return None
+        outs = niri_json("outputs")
+        out = outs.get(ws.get("output")) or next(iter(outs.values()), None)
+        logical = (out or {}).get("logical") or {}
+        lw, lh = logical.get("width"), logical.get("height")
+        if not lw or not lh:
+            return None
+        px, py = nx * lw, ny * lh
+        best = None
+        for w in niri_json("windows"):
+            if w.get("workspace_id") != ws.get("id"):
+                continue
+            lay = w.get("layout") or {}
+            pos = lay.get("tile_pos_in_workspace_view")
+            size = lay.get("tile_size")
+            if not pos or not size:
+                continue
+            if pos[0] <= px < pos[0] + size[0] and \
+                    pos[1] <= py < pos[1] + size[1]:
+                # floating windows render above tiles; prefer them
+                if best is None or \
+                        (w.get("is_floating") and not best.get("is_floating")):
+                    best = w
+        return best.get("id") if best else None
+    except Exception as exc:  # noqa: BLE001 - never kill the daemon here
+        log.debug("window_at failed: %s", exc)
+        return None
+
+
+def close_window(wid):
+    args = ["niri", "msg", "action", "close-window"]
+    if wid is not None:
+        args += ["--id", str(wid)]
+    try:
+        subprocess.Popen(args, env=niri_env(),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        log.error("close-window failed: %s", exc)
+
+
 class ActionRunner:
     def __init__(self, cfg, dry_run):
         self.cfg = cfg
@@ -763,36 +995,83 @@ def run_device(dev, cfg, dry_run):
                 pad.write(etype, code, value)
             pad.syn()
 
+    # Window gestures: a virtual absolute pointer + modifier keyboard let a
+    # 3-finger hold perform a genuine Mod+drag interactive window move.
+    ptr = None
+    kbd = None
+    emit_ptr = None
+    emit_kbd = None
+    if pad is not None and float(cfg["gestures"].get("hold_ms", 0) or 0) > 0:
+        ptr = UInput(
+            {
+                ec.EV_ABS: [
+                    (ec.ABS_X, AbsInfo(0, 0, PTR_RANGE, 0, 0, 0)),
+                    (ec.ABS_Y, AbsInfo(0, 0, PTR_RANGE, 0, 0, 0)),
+                ],
+                ec.EV_KEY: [ec.BTN_LEFT, ec.BTN_RIGHT, ec.BTN_MIDDLE],
+                ec.EV_REL: [ec.REL_WHEEL],
+            },
+            name=f"{VIRTUAL_NAME_SUFFIX} pointer",
+        )
+        kbd = UInput(
+            {ec.EV_KEY: list(MODIFIER_KEYS.values())},
+            name=f"{VIRTUAL_NAME_SUFFIX} keyboard",
+        )
+        log.info("virtual pointer and modifier keyboard created")
+
+        def emit_ptr(events):
+            for etype, code, value in events:
+                ptr.write(etype, code, value)
+            ptr.syn()
+
+        def emit_kbd(events):
+            for etype, code, value in events:
+                kbd.write(etype, code, value)
+            kbd.syn()
+
     engine = GestureEngine(
         cfg, emit, ActionRunner(cfg, dry_run), mm_x, mm_y,
         TransformCache(cfg["device"]["transform"]).get,
         emit_pad=emit_pad, pad_geom=pad_geom, calib=calib,
+        emit_ptr=emit_ptr, emit_kbd=emit_kbd,
+        window_at=window_at if pad is not None else None,
+        close_window=close_window if pad is not None else None,
     )
 
     dev.grab()
     log.info("grabbed %s", dev.path)
+    os.set_blocking(dev.fd, False)
     frame = []
     try:
-        for event in dev.read_loop():
-            if event.type == ec.EV_SYN:
-                if event.code == ec.SYN_REPORT:
-                    engine.process_frame(frame)
-                    frame = []
-                elif event.code == ec.SYN_DROPPED:
-                    log.warning("SYN_DROPPED: kernel event buffer overrun")
-                    frame = []
-            else:
-                frame.append((event.type, event.code, event.value))
+        while True:
+            ready, _, _ = select.select([dev.fd], [], [], 0.05)
+            if not ready:
+                engine.tick()
+                continue
+            try:
+                events = list(dev.read())
+            except BlockingIOError:
+                continue
+            for event in events:
+                if event.type == ec.EV_SYN:
+                    if event.code == ec.SYN_REPORT:
+                        engine.process_frame(frame)
+                        frame = []
+                    elif event.code == ec.SYN_DROPPED:
+                        log.warning("SYN_DROPPED: kernel event buffer overrun")
+                        frame = []
+                else:
+                    frame.append((event.type, event.code, event.value))
+            engine.tick()
     finally:
         try:
             dev.ungrab()
         except OSError:
             pass
         dev.close()
-        if ui is not None:
-            ui.close()
-        if pad is not None:
-            pad.close()
+        for virtual in (ui, pad, ptr, kbd):
+            if virtual is not None:
+                virtual.close()
 
 
 def main(argv=None):

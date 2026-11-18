@@ -8,6 +8,8 @@ compositor — the same gestures you already use on the trackpad, on the glass.
 | 3-finger swipe left / right | scroll through columns |
 | 3-finger swipe up / down | switch workspaces |
 | 4-finger swipe up / down | open / close Overview |
+| 3-finger hold on a window (`window-gestures` branch) | pick up and move the window (Mod+drag) |
+| 3-finger pinch on a window (`window-gestures` branch) | close that window |
 
 In the default **native mode** these are niri's *own* continuous gestures:
 the view moves 1:1 with your fingers and, on release, completes or snaps back
@@ -45,6 +47,19 @@ flat) — the daemon reads your accel profile/speed from the niri config and
 solves for the gain that pins the content under your fingertips. The
 4-finger Overview zoom keeps trackpad-equivalent travel instead (it is not a
 drag; `scale_overview` tunes it).
+
+**Window gestures** (the `window-gestures` branch; `main` is the pinned
+swipe-only version): holding 3 fingers still for `hold_ms` performs a real
+interactive move — the daemon warps a virtual absolute pointer to your
+fingers, holds a virtual Mod key, and presses the left button, so niri's own
+Mod+drag picks up the window under your fingers; it follows them (even if you
+lift down to one finger) and drops on release, anywhere, including onto other
+workspaces in the Overview. Pinching 3 fingers together by `pinch_close_mm`
+closes the window under the fingers: the daemon hit-tests the touch point
+against `niri msg windows` tile rectangles (`tile_pos_in_workspace_view` +
+`tile_size`, preferring floating windows) and issues
+`close-window --id <id>` — falling back to the focused window if the
+hit-test fails.
 
 There is also a **discrete mode** (`mode = "discrete"`) where the daemon
 interprets swipes itself and fires configurable `niri msg action …` steps —

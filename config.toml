@@ -32,6 +32,17 @@ scale_overview = 1.0
 
 # All distances are physical millimeters on the glass.
 deadzone_mm = 6.0        # travel before a gesture engages (both modes)
+
+# Window gestures (native mode only):
+# Hold 3 fingers still on a window for this long (ms) to pick it up and
+# move it — a genuine Mod+drag: the window lifts and follows your fingers,
+# drop it anywhere (0 disables).
+hold_ms = 350
+# Pinch 3 fingers together by this many mm to close the window under them
+# (0 disables).
+pinch_close_mm = 20.0
+# Modifier for the move drag; must match your niri Mod key.
+move_modifier = "Super"
 # The rest applies to discrete mode only:
 trigger_mm = 28.0        # first step of a 3-finger swipe
 repeat_mm = 36.0         # each further step while you keep swiping

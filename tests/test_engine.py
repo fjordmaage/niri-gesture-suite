@@ -92,18 +92,28 @@ def make_engine(clock, mode="discrete", scales=(1.0, 1.0, 1.0), calib=None):
     emitted = []
     acts = []
     pad_events = []
+    ptr_events = []
+    kbd_events = []
+    closed = []
+    native = mode == "native"
     engine = ntg.GestureEngine(
         cfg,
         emit=lambda evs: emitted.append(list(evs)),
         act=lambda n, d: acts.append((n, d)),
         mm_x=RES, mm_y=RES,
         transform_getter=lambda: "normal",
-        emit_pad=(lambda evs: pad_events.append(list(evs)))
-                 if mode == "native" else None,
-        pad_geom=PAD_GEOM if mode == "native" else None,
+        emit_pad=(lambda evs: pad_events.append(list(evs))) if native else None,
+        pad_geom=PAD_GEOM if native else None,
         calib=calib,
+        emit_ptr=(lambda evs: ptr_events.append(list(evs))) if native else None,
+        emit_kbd=(lambda evs: kbd_events.append(list(evs))) if native else None,
+        window_at=(lambda nx, ny: 42) if native else None,
+        close_window=(lambda wid: closed.append(wid)) if native else None,
     )
     engine._pad_events = pad_events
+    engine._ptr_events = ptr_events
+    engine._kbd_events = kbd_events
+    engine._closed = closed
     return engine, emitted, acts
 
 
@@ -473,6 +483,87 @@ def test_auto_gains():
     print("ok  auto gains: 1:1 view scale and overview multiplier")
 
 
+def flat_events(frames):
+    return [e for f in frames for e in f]
+
+
+def test_hold_to_move():
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(
+        clock, mode="native",
+        calib={"u": 10.0, "w_mm": 512.0, "h_mm": 358.0})
+    dev = FakeTouch()
+    for s, (x, y) in enumerate([(1000, 900), (1200, 900), (1400, 1100)]):
+        dev.down(s, x, y)
+    engine.process_frame(dev.frame())
+    # fingers rest still past hold_ms (350) -> move begins via tick()
+    clock.t += 0.4
+    engine.tick()
+    kbd = flat_events(engine._kbd_events)
+    ptr = flat_events(engine._ptr_events)
+    assert (ec.EV_KEY, ntg.ec.KEY_LEFTMETA, 1) in kbd, f"Super down: {kbd}"
+    assert (ec.EV_KEY, ec.BTN_LEFT, 1) in ptr, f"left button down: {ptr}"
+    # warp lands at the centroid: (1200, 966.7) units -> mm/size normalized
+    ax = [v for t, c, v in ptr if c == ec.ABS_X][0]
+    exp = round(1200 / RES / 512.0 * ntg.PTR_RANGE)
+    assert abs(ax - exp) <= 2, f"warp x {ax} != {exp}"
+    # drag 30 mm right: pointer follows
+    for i in range(1, 13):
+        clock.t += 0.01
+        for s, (x, y) in enumerate([(1000, 900), (1200, 900), (1400, 1100)]):
+            dev.move(s, x + mm(2.5) * i, y)
+        engine.process_frame(dev.frame())
+    ax2 = [v for t, c, v in flat_events(engine._ptr_events)
+           if c == ec.ABS_X][-1]
+    exp_d = 30.0 / 512.0 * ntg.PTR_RANGE
+    assert abs((ax2 - ax) - exp_d) <= 4, f"drag {ax2 - ax} != {exp_d}"
+    # lifting two fingers keeps dragging; lifting all ends the move
+    dev.up(0)
+    dev.up(1)
+    engine.process_frame(dev.frame())
+    kbd = flat_events(engine._kbd_events)
+    assert (ec.EV_KEY, ntg.ec.KEY_LEFTMETA, 0) not in kbd, "still dragging"
+    dev.up(2)
+    engine.process_frame(dev.frame())
+    ptr = flat_events(engine._ptr_events)
+    kbd = flat_events(engine._kbd_events)
+    assert (ec.EV_KEY, ec.BTN_LEFT, 0) in ptr, "button must release"
+    assert (ec.EV_KEY, ntg.ec.KEY_LEFTMETA, 0) in kbd, "Super must release"
+    assert engine._pad_events == [], "no swipe may reach the pad"
+    assert acts == [] and engine._closed == []
+    print("ok  3-finger hold starts Mod+drag window move, lift ends it")
+
+
+def test_pinch_close():
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(
+        clock, mode="native",
+        calib={"u": 10.0, "w_mm": 512.0, "h_mm": 358.0})
+    dev = FakeTouch()
+    base = [(1000, 1000), (1400, 1000), (1200, 1400)]
+    cx = sum(p[0] for p in base) / 3
+    cy = sum(p[1] for p in base) / 3
+    for s, (x, y) in enumerate(base):
+        dev.down(s, x, y)
+    engine.process_frame(dev.frame())
+    # contract contacts to 10% of their distance from the centroid
+    for i in range(1, 10):
+        clock.t += 0.01
+        k = 1.0 - 0.1 * i
+        for s, (x, y) in enumerate(base):
+            dev.move(s, int(cx + (x - cx) * k), int(cy + (y - cy) * k))
+        engine.process_frame(dev.frame())
+    assert engine._closed == [42], f"window 42 should close: {engine._closed}"
+    assert engine._pad_events == [], "pinch must not reach the pad"
+    assert engine._ptr_events == [], "pinch must not press buttons"
+    # the rest of the touch is swallowed
+    for s in range(3):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    assert len(engine._closed) == 1, "close must fire exactly once"
+    print("ok  3-finger pinch closes the window under the fingers")
+
+
 def test_niri_config_parse():
     import tempfile
     sample = """
@@ -523,6 +614,8 @@ def main():
         test_native_below_deadzone_quiet,
         test_native_finger_count_transition,
         test_auto_gains,
+        test_hold_to_move,
+        test_pinch_close,
         test_niri_config_parse,
     ]
     failures = 0
