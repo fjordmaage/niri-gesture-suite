@@ -51,6 +51,11 @@ DEFAULT_CONFIG = {
         # Travel before a trackpad gesture classifies (mm). Smaller than the
         # touchscreen deadzone so native swipes engage with less latency.
         "deadzone_mm": 3.0,
+        # Pinch thresholds on the trackpad (mm of mean contact distance
+        # change). Much smaller than on the glass: fingers start cramped,
+        # and accidental pinches are unlikely there.
+        "pinch_close_mm": 6.0,
+        "pinch_out_mm": 6.0,
     },
     "device": {
         # Substring or exact name of the touchscreen. Empty = auto-detect the
@@ -1910,8 +1915,11 @@ def make_trackpad_runner(dev, cfg, dry_run, shared):
     calib = {"u": libinput_units_per_mm("adaptive", 0.0),
              "w_mm": (xi.max - xi.min + 1) / mm_x,
              "h_mm": (yi.max - yi.min + 1) / mm_y}
+    tp = cfg["trackpad"]
     tcfg = deep_merge(cfg, {"gestures": {
-        "deadzone_mm": float(cfg["trackpad"].get("deadzone_mm", 3.0) or 3.0),
+        "deadzone_mm": float(tp.get("deadzone_mm", 3.0) or 3.0),
+        "pinch_close_mm": float(tp.get("pinch_close_mm", 6.0) or 0),
+        "pinch_out_mm": float(tp.get("pinch_out_mm", 6.0) or 0),
     }})
     engine = TrackpadEngine(
         tcfg, emit, mm_x, mm_y,
