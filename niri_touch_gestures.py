@@ -53,9 +53,10 @@ DEFAULT_CONFIG = {
         "deadzone_mm": 3.0,
         # Pinch thresholds on the trackpad (mm of mean contact distance
         # change). Much smaller than on the glass: fingers start cramped,
-        # and accidental pinches are unlikely there.
-        "pinch_close_mm": 6.0,
-        "pinch_out_mm": 6.0,
+        # and accidental pinches are unlikely there. 4- and 5-finger
+        # pinches scale these down further (x0.75 / x0.6) automatically.
+        "pinch_close_mm": 5.0,
+        "pinch_out_mm": 5.0,
     },
     "device": {
         # Substring or exact name of the touchscreen. Empty = auto-detect the
@@ -750,8 +751,7 @@ class GestureEngine:
         travel = math.hypot(*self.acc)
         n = len(self.down)
         self.last_norm = self._centroid_norm_logical() or self.last_norm
-        pinch_in = float(g.get("pinch_close_mm", 0) or 0)
-        pinch_out = float(g.get("pinch_out_mm", 0) or 0)
+        pinch_in, pinch_out = self._pinch_thresholds(g, n)
 
         if n in (3, 4, 5):
             # A pinch only needs to outrun 60% of the centroid travel, so
@@ -778,6 +778,10 @@ class GestureEngine:
             self._engage_swipe(g)
             return
         self._check_hold(g)
+
+    def _pinch_thresholds(self, g, n):
+        return (float(g.get("pinch_close_mm", 0) or 0),
+                float(g.get("pinch_out_mm", 0) or 0))
 
     def _engage_swipe(self, g):
         # Horizontal 4-finger swipes are media gestures (niri's own 4-finger
@@ -1388,6 +1392,15 @@ class TrackpadEngine(GestureEngine):
                 self.mode = FORWARD
 
     # -- classification overrides ------------------------------------------
+
+    def _pinch_thresholds(self, g, n):
+        pin, pout = super()._pinch_thresholds(g, n)
+        if n > 3:
+            # More fingers leave less room to move on the pad: scale the
+            # squeeze down accordingly (4 fingers: x0.75, 5: x0.6).
+            pin *= 3.0 / n
+            pout *= 3.0 / n
+        return pin, pout
 
     def _engage_swipe(self, g):
         # 4-finger horizontal media swipes are ours; everything else is a

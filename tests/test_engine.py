@@ -1035,6 +1035,16 @@ def test_tp_hold_and_media_swipe():
     print("ok  trackpad: hold drags via relative mouse, media swipe claims")
 
 
+def test_tp_pinch_count_scaling():
+    clock = FakeClock()
+    engine = make_tp_engine(clock)
+    g = {"pinch_close_mm": 5.0, "pinch_out_mm": 5.0}
+    assert engine._pinch_thresholds(g, 3) == (5.0, 5.0)
+    assert engine._pinch_thresholds(g, 4) == (3.75, 3.75)
+    assert engine._pinch_thresholds(g, 5) == (3.0, 3.0)
+    print("ok  trackpad pinch thresholds scale with finger count")
+
+
 def test_niri_config_parse():
     import tempfile
     sample = """
@@ -1101,6 +1111,7 @@ def main():
         test_tp_pinch_claim,
         test_tp_taps,
         test_tp_hold_and_media_swipe,
+        test_tp_pinch_count_scaling,
         test_niri_config_parse,
     ]
     failures = 0

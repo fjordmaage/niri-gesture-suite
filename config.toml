@@ -16,9 +16,10 @@ move_gain = 1.0
 # touchscreen deadzone so native swipes start with minimal latency.
 deadzone_mm = 3.0
 # Pinch thresholds on the trackpad (mm of mean contact distance change).
-# Much smaller than on the glass: fingers start cramped there.
-pinch_close_mm = 6.0
-pinch_out_mm = 6.0
+# Much smaller than on the glass: fingers start cramped there. 4- and
+# 5-finger pinches scale these down further (x0.75 / x0.6) automatically.
+pinch_close_mm = 5.0
+pinch_out_mm = 5.0
 
 [device]
 # Substring of the touchscreen's device name. Empty = auto-detect the first
