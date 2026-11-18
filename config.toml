@@ -38,9 +38,11 @@ deadzone_mm = 6.0        # travel before a gesture engages (both modes)
 # move it — a genuine Mod+drag: the window lifts and follows your fingers,
 # drop it anywhere (0 disables).
 hold_ms = 350
-# Pinch 3 fingers together by this many mm to close the window under them
-# (0 disables).
-pinch_close_mm = 20.0
+# Pinch fingers together / apart by this many mm (mean contact distance
+# from the centroid) to fire the [actions.pinch] entries below.
+# Lower = snappier. 0 disables that direction.
+pinch_close_mm = 12.0
+pinch_out_mm = 12.0
 # Modifier for the move drag; must match your niri Mod key.
 move_modifier = "Super"
 # The rest applies to discrete mode only:
@@ -71,3 +73,12 @@ up = "open-overview"
 down = "close-overview"
 left = ""
 right = ""
+
+# Pinch gestures (native mode): direction + finger count -> niri action.
+# Actions run on the window under your fingers: close-window targets it by
+# id, anything else focuses it first. "" disables.
+[actions.pinch]
+in3 = "close-window"
+out3 = "maximize-column"            # = your Mod+F
+in4 = ""
+out4 = "maximize-window-to-edges"   # = your Mod+M

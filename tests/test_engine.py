@@ -108,7 +108,8 @@ def make_engine(clock, mode="discrete", scales=(1.0, 1.0, 1.0), calib=None):
         emit_ptr=(lambda evs: ptr_events.append(list(evs))) if native else None,
         emit_kbd=(lambda evs: kbd_events.append(list(evs))) if native else None,
         window_at=(lambda nx, ny: 42) if native else None,
-        close_window=(lambda wid: closed.append(wid)) if native else None,
+        pinch_action=(lambda a, wid: closed.append((a, wid)))
+                     if native else None,
     )
     engine._pad_events = pad_events
     engine._ptr_events = ptr_events
@@ -553,7 +554,8 @@ def test_pinch_close():
         for s, (x, y) in enumerate(base):
             dev.move(s, int(cx + (x - cx) * k), int(cy + (y - cy) * k))
         engine.process_frame(dev.frame())
-    assert engine._closed == [42], f"window 42 should close: {engine._closed}"
+    assert engine._closed == [("close-window", 42)], \
+        f"window 42 should close: {engine._closed}"
     assert engine._pad_events == [], "pinch must not reach the pad"
     assert engine._ptr_events == [], "pinch must not press buttons"
     # the rest of the touch is swallowed
@@ -562,6 +564,40 @@ def test_pinch_close():
     engine.process_frame(dev.frame())
     assert len(engine._closed) == 1, "close must fire exactly once"
     print("ok  3-finger pinch closes the window under the fingers")
+
+
+def spread_run(fingers, action_expected):
+    clock = FakeClock()
+    engine, emitted, acts = make_engine(
+        clock, mode="native",
+        calib={"u": 10.0, "w_mm": 512.0, "h_mm": 358.0})
+    dev = FakeTouch()
+    base = [(1100, 1000), (1300, 1000), (1200, 1300), (1200, 850)][:fingers]
+    cx = sum(p[0] for p in base) / fingers
+    cy = sum(p[1] for p in base) / fingers
+    for s, (x, y) in enumerate(base):
+        dev.down(s, x, y)
+    engine.process_frame(dev.frame())
+    # spread contacts outward to 2.5x their distance from the centroid
+    for i in range(1, 11):
+        clock.t += 0.01
+        k = 1.0 + 0.15 * i
+        for s, (x, y) in enumerate(base):
+            dev.move(s, int(cx + (x - cx) * k), int(cy + (y - cy) * k))
+        engine.process_frame(dev.frame())
+    for s in range(fingers):
+        dev.up(s)
+    engine.process_frame(dev.frame())
+    assert engine._closed == [(action_expected, 42)], \
+        f"{fingers}-finger spread: {engine._closed}"
+    assert engine._pad_events == [], "spread must not reach the pad"
+    assert acts == []
+
+
+def test_spread_actions():
+    spread_run(3, "maximize-column")
+    spread_run(4, "maximize-window-to-edges")
+    print("ok  3-finger spread maximizes column, 4-finger to edges")
 
 
 def test_niri_config_parse():
@@ -616,6 +652,7 @@ def main():
         test_auto_gains,
         test_hold_to_move,
         test_pinch_close,
+        test_spread_actions,
         test_niri_config_parse,
     ]
     failures = 0

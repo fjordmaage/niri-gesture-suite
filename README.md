@@ -9,7 +9,9 @@ compositor — the same gestures you already use on the trackpad, on the glass.
 | 3-finger swipe up / down | switch workspaces |
 | 4-finger swipe up / down | open / close Overview |
 | 3-finger hold on a window (`window-gestures` branch) | pick up and move the window (Mod+drag) |
-| 3-finger pinch on a window (`window-gestures` branch) | close that window |
+| 3-finger pinch in on a window (`window-gestures` branch) | close that window |
+| 3-finger spread out (`window-gestures` branch) | maximize its column |
+| 4-finger spread out (`window-gestures` branch) | maximize the window to the edges |
 
 In the default **native mode** these are niri's *own* continuous gestures:
 the view moves 1:1 with your fingers and, on release, completes or snaps back

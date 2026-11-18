@@ -75,9 +75,13 @@ DEFAULT_CONFIG = {
         # under them and move it, exactly like Mod+drag with the mouse.
         # 0 disables. Native mode only.
         "hold_ms": 350,
-        # Pinch 3 fingers together by this many mm to close the window
-        # under them. 0 disables. Native mode only.
-        "pinch_close_mm": 20.0,
+        # Pinch 3 fingers together by this many mm (mean contact distance
+        # from the centroid) to trigger the in3 pinch action (close the
+        # window under them). 0 disables. Native mode only.
+        "pinch_close_mm": 12.0,
+        # Spread fingers apart by this many mm to trigger the out3/out4
+        # pinch actions. 0 disables. Native mode only.
+        "pinch_out_mm": 12.0,
         # Modifier used for the window-move drag; must match your niri Mod.
         # One of "Super", "Alt", "Ctrl", "Shift".
         "move_modifier": "Super",
@@ -108,6 +112,15 @@ DEFAULT_CONFIG = {
             "down": "close-overview",
             "left": "",
             "right": "",
+        },
+        # Pinch gestures (native mode): in/out + finger count -> niri action.
+        # The action targets the window under the fingers (close-window
+        # directly by id; other actions via focus-window first).
+        "pinch": {
+            "in3": "close-window",
+            "out3": "maximize-column",
+            "in4": "",
+            "out4": "maximize-window-to-edges",
         },
     },
 }
@@ -307,7 +320,7 @@ class GestureEngine:
     def __init__(self, cfg, emit, act, mm_x, mm_y, transform_getter,
                  emit_pad=None, pad_geom=None, calib=None,
                  emit_ptr=None, emit_kbd=None,
-                 window_at=None, close_window=None):
+                 window_at=None, pinch_action=None):
         self.cfg = cfg
         self.emit = emit
         self.act = act
@@ -326,7 +339,7 @@ class GestureEngine:
         self.emit_ptr = emit_ptr      # virtual absolute pointer
         self.emit_kbd = emit_kbd      # virtual modifier keyboard
         self.window_at = window_at    # (nx, ny) -> window id or None
-        self.close_window = close_window  # (window id or None) -> ()
+        self.pinch_action = pinch_action  # (action str, window id or None)
         self.move_key = MODIFIER_KEYS.get(
             str(cfg["gestures"].get("move_modifier", "Super")).lower(),
             ec.KEY_LEFTMETA)
@@ -560,14 +573,21 @@ class GestureEngine:
 
         travel = math.hypot(*self.acc)
         n = len(self.down)
-        pinch_mm = float(g.get("pinch_close_mm", 0) or 0)
+        pinch_in = float(g.get("pinch_close_mm", 0) or 0)
+        pinch_out = float(g.get("pinch_out_mm", 0) or 0)
 
-        if n == 3 and pinch_mm > 0 and self.pinch_acc <= -pinch_mm \
-                and -self.pinch_acc >= travel:
-            self._pinch_close()
-            return
-        if travel >= g["deadzone_mm"] and \
-                (n != 3 or travel >= 1.2 * abs(self.pinch_acc)):
+        if n in (3, 4):
+            # A pinch only needs to outrun 60% of the centroid travel, so
+            # asymmetric pinches (anchored thumb) still fire promptly.
+            if pinch_in > 0 and self.pinch_acc <= -pinch_in \
+                    and -self.pinch_acc >= 0.6 * travel:
+                self._pinch_fire(f"in{n}")
+                return
+            if pinch_out > 0 and self.pinch_acc >= pinch_out \
+                    and self.pinch_acc >= 0.6 * travel:
+                self._pinch_fire(f"out{n}")
+                return
+        if travel >= g["deadzone_mm"] and travel >= 1.2 * abs(self.pinch_acc):
             self._engage_swipe(g)
             return
         self._check_hold(g)
@@ -627,15 +647,19 @@ class GestureEngine:
         f = ABS_TRANSFORMS.get(self.transform_name, ABS_TRANSFORMS["normal"])
         return f(nx, ny)
 
-    # -- pinch to close ----------------------------------------------------
+    # -- pinch in/out ------------------------------------------------------
 
-    def _pinch_close(self):
+    def _pinch_fire(self, key):
+        actions = (self.cfg.get("actions") or {}).get("pinch") or {}
+        action = actions.get(key, "")
         self.sub = "done"
+        if not action or self.pinch_action is None:
+            return
         pos = self._centroid_norm_logical()
         wid = self.window_at(*pos) if (self.window_at and pos) else None
-        log.info("pinch close (window %s)", wid if wid else "focused")
-        if self.close_window:
-            self.close_window(wid)
+        log.info("pinch %s -> %s (window %s)",
+                 key, action, wid if wid else "focused")
+        self.pinch_action(action, wid)
 
     # -- hold to move (virtual Mod+drag) -----------------------------------
 
@@ -881,15 +905,28 @@ def window_at(nx, ny):
         return None
 
 
-def close_window(wid):
-    args = ["niri", "msg", "action", "close-window"]
-    if wid is not None:
-        args += ["--id", str(wid)]
+def pinch_action(action, wid):
+    """Run a niri action on the window under the fingers: close-window
+    targets it directly by id; anything else focuses it first."""
+    env = niri_env()
     try:
-        subprocess.Popen(args, env=niri_env(),
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError as exc:
-        log.error("close-window failed: %s", exc)
+        if action.strip() == "close-window":
+            args = ["niri", "msg", "action", "close-window"]
+            if wid is not None:
+                args += ["--id", str(wid)]
+            subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            return
+        if wid is not None:
+            subprocess.run(
+                ["niri", "msg", "action", "focus-window", "--id", str(wid)],
+                env=env, timeout=2,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(
+            ["niri", "msg", "action"] + shlex.split(action),
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.error("pinch action %r failed: %s", action, exc)
 
 
 class ActionRunner:
@@ -1035,7 +1072,7 @@ def run_device(dev, cfg, dry_run):
         emit_pad=emit_pad, pad_geom=pad_geom, calib=calib,
         emit_ptr=emit_ptr, emit_kbd=emit_kbd,
         window_at=window_at if pad is not None else None,
-        close_window=close_window if pad is not None else None,
+        pinch_action=pinch_action if pad is not None else None,
     )
 
     dev.grab()
