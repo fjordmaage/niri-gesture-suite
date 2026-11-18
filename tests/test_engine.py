@@ -903,8 +903,11 @@ def test_tp_swipe_replay():
     engine.process_frame(dev.frame())   # forwarded live
     dev.down(1, 500, 300)
     engine.process_frame(dev.frame())
-    dev.down(2, 700, 300)               # buffering starts
+    dev.down(2, 700, 300)
     engine.process_frame(dev.frame())
+    # zero added latency: the clone sees the 3rd finger the instant it lands
+    down, pos, keys = clone_state(engine._emitted)
+    assert len(down) == 3, f"landing must forward live: {down}"
     for i in range(1, 7):
         clock.t += 0.01
         for s in range(3):
@@ -967,7 +970,9 @@ def test_tp_taps():
         dev.up(s)
     engine.process_frame(dev.frame())
     assert engine._pinches == [("spawn noctalia msg media toggle", None)]
-    assert engine._emitted == [], "4-finger tap must be swallowed"
+    down, pos, keys = clone_state(engine._emitted)
+    assert not down and keys.get(ec.BTN_TOUCH) == 0, \
+        "clone must end with no contacts"
 
     # 3-finger tap -> replayed so libinput's middle-click tap still works
     engine._pinches.clear()
@@ -1015,9 +1020,8 @@ def test_tp_hold_and_media_swipe():
     assert (ec.EV_KEY, ec.BTN_LEFT, 0) in rel
     assert (ec.EV_KEY, ntg.ec.KEY_LEFTMETA, 0) in kbd
 
-    # fast 4-finger horizontal swipe -> media next, swallowed
+    # fast 4-finger horizontal swipe -> media previous, claimed
     engine._pinches.clear()
-    n_fwd = len(engine._emitted)
     for s, x in enumerate((300, 500, 700, 900)):
         dev.down(s, x, 500)
     engine.process_frame(dev.frame())
@@ -1031,7 +1035,8 @@ def test_tp_hold_and_media_swipe():
     engine.process_frame(dev.frame())
     assert engine._pinches == [("spawn noctalia msg media previous", None)], \
         f"media swipe: {engine._pinches}"
-    assert len(engine._emitted) == n_fwd, "media swipe must be swallowed"
+    down, pos, keys = clone_state(engine._emitted)
+    assert not down, "claimed media swipe must leave no clone contacts"
     print("ok  trackpad: hold drags via relative mouse, media swipe claims")
 
 

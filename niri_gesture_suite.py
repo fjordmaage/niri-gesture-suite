@@ -1242,13 +1242,14 @@ class GestureEngine:
 class TrackpadEngine(GestureEngine):
     """Gesture engine profile for a real touchpad.
 
-    Unlike the touchscreen, niri's native 3/4-finger swipes must keep
-    working, so 3+ finger frames are buffered until classified: a swipe
-    replays the buffer to the clone verbatim (native gesture, tiny delay),
-    while pinches, holds, and 4/5-finger taps are claimed - the already
-    forwarded contacts are cancelled and the daemon acts. 1/2-finger input
-    (pointer, scroll, taps) is forwarded untouched. Holds drive a virtual
-    relative mouse, so the grab happens at the current cursor position.
+    Unlike the touchscreen, 3+ finger touchpad input never reaches apps -
+    libinput routes it to the compositor's gesture layer - so everything is
+    forwarded to the clone LIVE, with zero added latency for niri's native
+    swipes, while the daemon classifies in parallel. When a pinch, hold, or
+    4/5-finger tap claims the gesture, the clone's contacts are cancelled
+    (ending whatever libinput had tentatively begun) and the daemon acts.
+    Holds drive a virtual relative mouse, so the grab happens at the
+    current cursor position.
     """
 
     def __init__(self, cfg, emit, mm_x, mm_y, emit_kbd=None, emit_rel=None,
@@ -1264,28 +1265,26 @@ class TrackpadEngine(GestureEngine):
         )
         self.emit_rel = emit_rel
         self.move_gain = move_gain
-        self.relay_buf = []
-        self.relay_pre = set()
         self.relay_claimed = False
         self.rel_rem = [0.0, 0.0]
 
     # -- relay plumbing ----------------------------------------------------
 
-    def _relay_begin(self, pre_active, events):
+    def _relay_begin(self, events):
         self.mode = GESTURE
         self._reset_gesture()
         self.t0 = time.monotonic()
         self.still_since = self.t0
         self.max_count = len(self.down)
-        self.relay_buf = [list(events)]
-        self.relay_pre = set(pre_active)
         self.relay_claimed = False
+        self._forward(events)
         self._track()
 
     def _relay_cancel(self):
-        """Claim the gesture: lift the contacts the clone still has down."""
+        """Claim the gesture: lift every contact the clone still has down,
+        ending whatever gesture libinput had tentatively begun."""
         out = []
-        for slot in sorted(self.relay_pre):
+        for slot in sorted(self.down):
             out.append((ec.EV_ABS, ec.ABS_MT_SLOT, slot))
             out.append((ec.EV_ABS, ec.ABS_MT_TRACKING_ID, -1))
         for code, value in list(self.key_state.items()):
@@ -1293,69 +1292,16 @@ class TrackpadEngine(GestureEngine):
                 out.append((ec.EV_KEY, code, 0))
         if out:
             self._emit(out)
-        self.relay_buf = []
-        self.relay_pre = set()
         self.relay_claimed = True
         self.resync = True
 
-    def _relay_resync(self):
-        if self.resync:
-            # an earlier claimed gesture was swallowed; bring the clone's
-            # per-slot position caches up to date first
-            prefix = self._resync_prefix()
-            if prefix:
-                self._emit(prefix)
-            self.resync = False
-
-    def _relay_replay(self):
-        """Not one of ours and the fingers are lifting: hand the buffered
-        frames to the clone verbatim (used for taps, where the deltas are
-        tiny and libinput's touch-jump detection cannot trigger)."""
-        self._relay_resync()
-        for frame in self.relay_buf:
-            evs = [(t, c, v) for t, c, v in frame if t != ec.EV_SYN]
-            if evs:
-                self._emit(evs)
-        self.relay_buf = []
-        self.relay_pre = set()
-
-    def _relay_catchup(self):
-        """A native swipe is underway: collapse the buffer into one frame
-        that lands/advances the contacts at their current positions, then
-        let the live stream continue. Replaying the motion history as a
-        burst would be read by libinput's touch-jump detection (deltas are
-        normalized to a 12 ms frame interval) as hardware glitches, and the
-        fastest part of the swipe would be discarded."""
-        self._relay_resync()
-        out = []
-        for slot in sorted(self.down):
-            p = self.pos.get(slot)
-            if p is None or p[0] is None or p[1] is None:
-                continue
-            out.append((ec.EV_ABS, ec.ABS_MT_SLOT, slot))
-            if slot not in self.relay_pre:
-                out.append((ec.EV_ABS, ec.ABS_MT_TRACKING_ID,
-                            self.down[slot]))
-            out.append((ec.EV_ABS, ec.ABS_MT_POSITION_X, p[0]))
-            out.append((ec.EV_ABS, ec.ABS_MT_POSITION_Y, p[1]))
-        for code, value in self.real_abs.items():
-            out.append((ec.EV_ABS, code, value))
-        for code, value in self.real_keys.items():
-            if self.key_state.get(code, 0) != value:
-                out.append((ec.EV_KEY, code, value))
-        if out:
-            self._emit(out)
-        self.relay_buf = []
-        self.relay_pre = set()
-
     def process_frame(self, events):
-        pre_active = set(self.down)
         self._apply(events)
         count = len(self.down)
 
         if self.mode == FORWARD:
             if count >= 3:
-                self._relay_begin(pre_active, events)
+                self._relay_begin(events)
             else:
                 self._forward(events)
         elif self.mode == GESTURE:
@@ -1367,26 +1313,26 @@ class TrackpadEngine(GestureEngine):
                     self.mode = FORWARD
                 else:
                     self._track()
-            elif self.sub == "pass":
+            elif self.sub in ("pending", "pass"):
+                # live forwarding: native swipes see zero added latency
                 self._forward(events)
-                if count == 0:
+                if self.sub == "pending":
+                    if count >= 3:
+                        self._track()
+                    else:
+                        self._finalize()  # 4/5-finger taps may claim here
+                        self.mode = DRAIN if (self.relay_claimed
+                                              and count > 0) else FORWARD
+                        self.relay_claimed = False
+                        if self.mode == FORWARD:
+                            self._reset_gesture()
+                elif count == 0:
                     self._reset_gesture()
                     self.mode = FORWARD
-            elif count >= 3:
-                if self.sub == "pending":
-                    self.relay_buf.append(list(events))
-                self._track()
-            else:
-                if self.sub == "pending":
-                    self.relay_buf.append(list(events))
-                    self._finalize()  # _check_taps claims or replays
-                else:
+            else:  # "done": claimed mid-gesture; swallow the rest
+                if count < 3:
                     self._finalize()
-                if self.relay_claimed:
-                    self.relay_claimed = False
                     self.mode = DRAIN if count > 0 else FORWARD
-                else:
-                    self.mode = FORWARD
         elif self.mode == DRAIN:
             if count == 0:
                 self.mode = FORWARD
@@ -1415,7 +1361,7 @@ class TrackpadEngine(GestureEngine):
                 log.info("trackpad 4-finger swipe -> %s", action)
                 self.pinch_action(action, None)
                 return
-        self._relay_catchup()
+        # native niri gesture: it has been flowing live all along
         self.sub = "pass"
 
     def _pinch_fire(self, key):
@@ -1429,27 +1375,22 @@ class TrackpadEngine(GestureEngine):
         self.pinch_action(action, None)
 
     def _check_taps(self, g):
-        """At gesture end: claim a 4/5-finger tap, else replay so native
-        libinput taps (e.g. 3-finger middle click) keep working."""
-        claimed = False
+        """At gesture end: claim a 4/5-finger tap. 1-3 finger taps were
+        forwarded live, so libinput's own taps (3-finger middle click)
+        keep working; libinput ignores 4/5-finger touches as taps."""
         now = time.monotonic()
         quick = (now - self.t0) * 1000.0 <= float(g.get("tap_ms", 250) or 250)
         still = math.hypot(*self.acc) < g["deadzone_mm"] and \
             abs(self.pinch_acc) < 5.0
-        if quick and still and self.pinch_action is not None:
-            taps = (self.cfg.get("actions") or {}).get("tap") or {}
-            if self.max_count >= 5 and taps.get("five"):
-                claimed = True
-                log.info("trackpad 5-finger tap -> %s", taps["five"])
-            elif self.max_count == 4 and taps.get("four"):
-                claimed = True
-                log.info("trackpad 4-finger tap -> %s", taps["four"])
-        if claimed:
-            action = taps["five"] if self.max_count >= 5 else taps["four"]
+        if not (quick and still and self.pinch_action is not None):
+            return
+        taps = (self.cfg.get("actions") or {}).get("tap") or {}
+        action = taps.get("five", "") if self.max_count >= 5 else \
+            taps.get("four", "") if self.max_count == 4 else ""
+        if action:
+            log.info("trackpad %d-finger tap -> %s", self.max_count, action)
             self._relay_cancel()
             self.pinch_action(action, None)
-        else:
-            self._relay_replay()
 
     # -- hold-to-move at the cursor (relative mouse) -----------------------
 
